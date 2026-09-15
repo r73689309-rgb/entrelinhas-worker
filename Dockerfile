@@ -1,6 +1,5 @@
 # Worker serverless RunPod — ComfyUI + FLUX + PuLID + ReActor + Wan 2.2
-# Os modelos ficam DENTRO da imagem: o endpoint nao depende de network volume
-# e por isso pode rodar em qualquer datacenter.
+# Os modelos NAO vao na imagem: ficam no network volume, montado em /runpod-volume.
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -45,49 +44,7 @@ RUN git clone --depth 1 https://github.com/balazik/ComfyUI-PuLID-Flux.git \
       fi; \
     done
 
-# ---------------------------------------------------------------- modelos
-ARG HF=https://huggingface.co
-WORKDIR $COMFY/models
-RUN mkdir -p unet text_encoders vae loras pulid diffusion_models insightface facerestore_models
-
-# 5a) FLUX (foto)
-RUN wget -q -O unet/flux1-dev-fp8.safetensors \
-      $HF/Kijai/flux-fp8/resolve/main/flux1-dev-fp8.safetensors \
- && wget -q -O text_encoders/t5xxl_fp8_e4m3fn.safetensors \
-      $HF/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors \
- && wget -q -O text_encoders/clip_l.safetensors \
-      $HF/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors \
- && wget -q -O vae/ae.safetensors \
-      $HF/Comfy-Org/Lumina_Image_2.0_Repackaged/resolve/main/split_files/vae/ae.safetensors \
- && wget -q -O loras/boreal-v2.safetensors \
-      $HF/kudzueye/boreal-flux-dev-v2/resolve/main/boreal-v2.safetensors
-
-# 5b) PuLID (identidade do rosto) + EVA-CLIP no cache do HF
-RUN wget -q -O pulid/pulid_flux_v0.9.1.safetensors \
-      $HF/guozinan/PuLID/resolve/main/pulid_flux_v0.9.1.safetensors \
- && python -c "from huggingface_hub import hf_hub_download; hf_hub_download('QuanSun/EVA-CLIP','EVA02_CLIP_L_336_psz14_s6B.pt')"
-
-# 5c) ReActor (troca de rosto) + antelopev2 (deteccao usada pelo PuLID)
-RUN wget -q -O insightface/inswapper_128.onnx \
-      $HF/datasets/Gourieff/ReActor/resolve/main/models/inswapper_128.onnx \
- && wget -q -O facerestore_models/codeformer-v0.1.0.pth \
-      $HF/datasets/Gourieff/ReActor/resolve/main/models/facerestore_models/codeformer-v0.1.0.pth \
- && mkdir -p insightface/models \
- && wget -q -O /tmp/antelopev2.zip $HF/MonsterMMORPG/tools/resolve/main/antelopev2.zip \
- && unzip -q /tmp/antelopev2.zip -d insightface/models/ && rm /tmp/antelopev2.zip
-
-# 5d) Wan 2.2 (video)
-RUN wget -q -O diffusion_models/wan2.2_ti2v_5B_fp16.safetensors \
-      $HF/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors \
- && wget -q -O text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors \
-      $HF/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors \
- && wget -q -O vae/wan2.2_vae.safetensors \
-      $HF/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan2.2_vae.safetensors
-
-# compatibilidade: versoes antigas do ComfyUI procuram os text encoders em models/clip
-RUN rm -rf $COMFY/models/clip && ln -s text_encoders $COMFY/models/clip
-
-# 6) SDK do runpod + handler
+# 5) SDK do runpod + handler
 RUN pip install runpod requests
 WORKDIR /
 COPY handler.py /handler.py
