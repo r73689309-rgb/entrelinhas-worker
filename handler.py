@@ -5,12 +5,17 @@ Entrada aceita:
   {"workflow": {...}}                      -> executa o workflow em formato API
   {"workflow": {...}, "images": [ {"name":"ref.png","image":"<base64>"} ]}
   {"get": "/object_info"}                  -> proxy GET para a API do ComfyUI
+  {"ls": "loras"}                          -> lista os arquivos de modelo no volume
+  {"download": {"url": "...", "dir": "loras", "name": "x.safetensors"}}
+                                           -> baixa um modelo direto para o volume
 Saida:
   {"images":[{"filename":..., "mime":..., "data":"<base64>"}], "seconds": 12.3}
 """
 import base64
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -64,6 +69,86 @@ def link_models():
                 print("[worker]   ->", name)
         except Exception as e:
             print("[worker]   falhou", name, e)
+
+
+SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def models_root():
+    for r in ("/runpod-volume/models_store",
+              "/runpod-volume/ComfyUI/models",
+              "/runpod-volume/models"):
+        if os.path.isdir(r):
+            return r
+    return None
+
+
+def list_models(which=None):
+    root = models_root()
+    if not root:
+        return {"error": "nenhum diretorio de modelos encontrado em /runpod-volume"}
+    out = {}
+    names = [which] if isinstance(which, str) and which else sorted(os.listdir(root))
+    for name in names:
+        d = os.path.join(root, name)
+        if not os.path.isdir(d):
+            continue
+        files = []
+        for f in sorted(os.listdir(d)):
+            p = os.path.join(d, f)
+            if os.path.isfile(p):
+                files.append({"name": f, "mb": round(os.path.getsize(p) / 1048576, 1)})
+        out[name] = files
+    free = shutil.disk_usage(root)
+    return {"root": root, "dirs": out,
+            "free_gb": round(free.free / 1073741824, 1),
+            "total_gb": round(free.total / 1073741824, 1)}
+
+
+def download_model(spec):
+    root = models_root()
+    if not root:
+        return {"error": "nenhum diretorio de modelos encontrado em /runpod-volume"}
+    url = (spec.get("url") or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return {"error": "url invalida"}
+    sub = (spec.get("dir") or "").strip()
+    name = (spec.get("name") or "").strip() or os.path.basename(url.split("?")[0])
+    if not SAFE.match(sub or "x") or not SAFE.match(name):
+        return {"error": "nome de pasta ou arquivo invalido"}
+    dest_dir = os.path.join(root, sub) if sub else root
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, name)
+    if os.path.exists(dest) and not spec.get("overwrite"):
+        return {"ok": True, "path": dest, "mb": round(os.path.getsize(dest) / 1048576, 1),
+                "note": "ja existia; nada foi baixado"}
+    headers = {"User-Agent": "entrelinhas-worker"}
+    if spec.get("token"):
+        headers["Authorization"] = "Bearer " + spec["token"]
+    req = urllib.request.Request(url, headers=headers)
+    tmp = dest + ".part"
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return {"error": f"falha ao baixar: {e}"}
+    os.replace(tmp, dest)
+    mb = round(os.path.getsize(dest) / 1048576, 1)
+    # o ComfyUI so enxerga o arquivo novo depois de reler a pasta
+    try:
+        api_get("/object_info/CheckpointLoaderSimple")
+    except Exception:
+        pass
+    return {"ok": True, "path": dest, "mb": mb, "seconds": round(time.time() - t0, 1)}
 
 
 # ---------------------------------------------------------------- comfyui
@@ -165,6 +250,14 @@ def collect(history_entry):
 # ---------------------------------------------------------------- handler
 def handler(job):
     inp = job.get("input") or {}
+
+    # estas nao precisam do ComfyUI no ar
+    if inp.get("ls") is not None:
+        return list_models(inp.get("ls"))
+
+    if inp.get("download"):
+        return download_model(inp["download"])
+
     start_comfy()
 
     if inp.get("get"):
