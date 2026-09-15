@@ -29,7 +29,7 @@ COMFY = os.environ.get("COMFY", "/comfyui")
 HOST = "127.0.0.1:8188"
 OUT_DIR = "/tmp/comfy-out"
 TMP_DIR = "/tmp/comfy-tmp"
-BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "300"))
+BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "600"))
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "900"))
 
 _proc = None
@@ -37,7 +37,7 @@ _proc = None
 
 # ---------------------------------------------------------------- modelos
 def link_models():
-    """Liga os diretorios de modelos do network volume dentro do ComfyUI."""
+    """Se houver network volume, liga os diretorios de modelos dele no ComfyUI."""
     roots = [
         "/runpod-volume/models_store",
         "/runpod-volume/ComfyUI/models",
@@ -140,11 +140,27 @@ def download_model(spec):
         return {"error": f"falha ao baixar: {e}"}
     os.replace(tmp, dest)
     mb = round(os.path.getsize(dest) / 1048576, 1)
+    extracted = None
+    if spec.get("unzip"):
+        try:
+            import zipfile
+            out = os.path.join(dest_dir, "models") if sub == "insightface" else dest_dir
+            os.makedirs(out, exist_ok=True)
+            with zipfile.ZipFile(dest) as z:
+                bad = [n for n in z.namelist() if n.startswith("/") or ".." in n]
+                if bad:
+                    return {"error": "zip com caminhos suspeitos", "detail": bad[:5]}
+                z.extractall(out)
+                extracted = z.namelist()[:20]
+            os.remove(dest)
+        except Exception as e:
+            return {"error": f"baixou mas nao descompactou: {e}", "path": dest, "mb": mb}
     try:
         api_get("/object_info/CheckpointLoaderSimple")
     except Exception:
         pass
-    return {"ok": True, "path": dest, "mb": mb, "seconds": round(time.time() - t0, 1)}
+    return {"ok": True, "path": dest, "mb": mb, "extracted": extracted,
+            "seconds": round(time.time() - t0, 1)}
 
 
 # ---------------------------------------------------------------- comfyui
@@ -159,6 +175,8 @@ def comfy_up():
 def start_comfy():
     global _proc
     if _proc and _proc.poll() is None:
+        while not comfy_up():
+            time.sleep(1)
         return
     os.makedirs(OUT_DIR, exist_ok=True)
     os.makedirs(TMP_DIR, exist_ok=True)
@@ -307,8 +325,6 @@ def handler(job):
 
 
 if __name__ == "__main__":
-    try:
-        start_comfy()
-    except Exception as e:
-        print("[worker] falha ao subir o ComfyUI no boot:", e)
+    # NAO subir o ComfyUI aqui: a RunPod espera o worker se registrar em poucos
+    # segundos e mata o processo se ele demorar. O ComfyUI sobe no primeiro job.
     runpod.serverless.start({"handler": handler})
