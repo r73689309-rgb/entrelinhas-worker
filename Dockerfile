@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3.10 /usr/bin/python \
     && python -m pip install --upgrade pip setuptools wheel
 
-# 1) torch (cu126) — o ComfyUI atual (comfy_kitchen) exige torch >= 2.7
+# 1) torch (cu128) — o ComfyUI atual (comfy_kitchen) exige torch >= 2.7
 RUN pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
       --index-url https://download.pytorch.org/whl/cu128
 
@@ -45,15 +45,24 @@ RUN git clone --depth 1 https://github.com/balazik/ComfyUI-PuLID-Flux.git \
       fi; \
     done
 
+# 4b) Compatibilidade: o ComfyUI novo chama forward_orig com argumentos extras
+#     (timestep_zero_index, transformer_options, attn_mask) que o no PuLID-Flux
+#     nao conhece. Aceitamos e ignoramos — e o comportamento antigo.
+RUN P=$COMFY/custom_nodes/ComfyUI-PuLID-Flux/pulidflux.py \
+ && sed -i 's|^    control=None,$|    control=None,\n    timestep_zero_index=None,\n    transformer_options={},\n    attn_mask: Tensor = None,\n    **kwargs,|' $P \
+ && grep -q "timestep_zero_index" $P \
+ && python3 -c "import ast,sys; ast.parse(open('$P').read())" \
+ && echo "pulidflux.py corrigido"
+
 # ---------------------------------------------------------------- modelos
 ARG HF=https://huggingface.co
 WORKDIR $COMFY/models
 RUN mkdir -p unet text_encoders vae loras pulid diffusion_models insightface facerestore_models
 
-# 5a) FLUX
-RUN wget -q -O unet/flux1-dev-fp8.safetensors \
-      $HF/Kijai/flux-fp8/resolve/main/flux1-dev-fp8.safetensors
-RUN wget -q -O text_encoders/t5xxl_fp8_e4m3fn.safetensors \
+# 5a) FLUX (foto)
+RUN wget -q --show-progress -O unet/flux1-dev-fp8.safetensors \
+      $HF/Kijai/flux-fp8/resolve/main/flux1-dev-fp8.safetensors \
+ && wget -q -O text_encoders/t5xxl_fp8_e4m3fn.safetensors \
       $HF/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors \
  && wget -q -O text_encoders/clip_l.safetensors \
       $HF/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors \
@@ -62,12 +71,12 @@ RUN wget -q -O text_encoders/t5xxl_fp8_e4m3fn.safetensors \
  && wget -q -O loras/boreal-v2.safetensors \
       $HF/kudzueye/boreal-flux-dev-v2/resolve/main/boreal-v2.safetensors
 
-# 5b) PuLID + EVA-CLIP
+# 5b) PuLID (identidade do rosto) + EVA-CLIP no cache do HF
 RUN wget -q -O pulid/pulid_flux_v0.9.1.safetensors \
       $HF/guozinan/PuLID/resolve/main/pulid_flux_v0.9.1.safetensors \
  && python -c "from huggingface_hub import hf_hub_download; hf_hub_download('QuanSun/EVA-CLIP','EVA02_CLIP_L_336_psz14_s6B.pt')"
 
-# 5c) ReActor + antelopev2
+# 5c) ReActor (troca de rosto) + antelopev2 (deteccao usada pelo PuLID)
 RUN wget -q -O insightface/inswapper_128.onnx \
       $HF/datasets/Gourieff/ReActor/resolve/main/models/inswapper_128.onnx \
  && wget -q -O facerestore_models/codeformer-v0.1.0.pth \
@@ -78,13 +87,13 @@ RUN wget -q -O insightface/inswapper_128.onnx \
 
 # 5d) Wan 2.2 (video)
 RUN wget -q -O diffusion_models/wan2.2_ti2v_5B_fp16.safetensors \
-      $HF/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors
-RUN wget -q -O text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors \
+      $HF/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors \
+ && wget -q -O text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors \
       $HF/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors \
  && wget -q -O vae/wan2.2_vae.safetensors \
       $HF/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan2.2_vae.safetensors
 
-# versoes antigas do ComfyUI procuram os text encoders em models/clip
+# compatibilidade: versoes antigas do ComfyUI procuram os text encoders em models/clip
 RUN rm -rf $COMFY/models/clip && ln -s text_encoders $COMFY/models/clip
 
 # 6) SDK do runpod + handler
