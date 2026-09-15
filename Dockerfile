@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # 1) torch (cu126) — o ComfyUI atual (comfy_kitchen) exige torch >= 2.7
 RUN pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
-      --index-url https://download.pytorch.org/whl/cu126
+      --index-url https://download.pytorch.org/whl/cu128
 
 # 2) ComfyUI
 RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git $COMFY \
