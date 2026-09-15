@@ -5,9 +5,9 @@ Entrada aceita:
   {"workflow": {...}}                      -> executa o workflow em formato API
   {"workflow": {...}, "images": [ {"name":"ref.png","image":"<base64>"} ]}
   {"get": "/object_info"}                  -> proxy GET para a API do ComfyUI
-  {"ls": "loras"}                          -> lista os arquivos de modelo no volume
+  {"ls": "loras"}                          -> lista os arquivos de modelo disponiveis
   {"download": {"url": "...", "dir": "loras", "name": "x.safetensors"}}
-                                           -> baixa um modelo direto para o volume
+                                           -> baixa um modelo para a pasta de modelos
 Saida:
   {"images":[{"filename":..., "mime":..., "data":"<base64>"}], "seconds": 12.3}
 """
@@ -45,11 +45,7 @@ def link_models():
     ]
     root = next((r for r in roots if os.path.isdir(r)), None)
     if not root:
-        print("[worker] AVISO: nenhum diretorio de modelos encontrado em /runpod-volume")
-        try:
-            print("[worker] conteudo de /runpod-volume:", os.listdir("/runpod-volume"))
-        except Exception as e:
-            print("[worker] /runpod-volume inacessivel:", e)
+        print("[worker] sem network volume: usando os modelos da propria imagem")
         return
     print("[worker] usando modelos de", root)
     dest_root = os.path.join(COMFY, "models")
@@ -77,7 +73,8 @@ SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 def models_root():
     for r in ("/runpod-volume/models_store",
               "/runpod-volume/ComfyUI/models",
-              "/runpod-volume/models"):
+              "/runpod-volume/models",
+              os.path.join(COMFY, "models")):
         if os.path.isdir(r):
             return r
     return None
@@ -86,7 +83,7 @@ def models_root():
 def list_models(which=None):
     root = models_root()
     if not root:
-        return {"error": "nenhum diretorio de modelos encontrado em /runpod-volume"}
+        return {"error": "nenhum diretorio de modelos encontrado"}
     out = {}
     names = [which] if isinstance(which, str) and which else sorted(os.listdir(root))
     for name in names:
@@ -108,7 +105,7 @@ def list_models(which=None):
 def download_model(spec):
     root = models_root()
     if not root:
-        return {"error": "nenhum diretorio de modelos encontrado em /runpod-volume"}
+        return {"error": "nenhum diretorio de modelos encontrado"}
     url = (spec.get("url") or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         return {"error": "url invalida"}
@@ -143,7 +140,6 @@ def download_model(spec):
         return {"error": f"falha ao baixar: {e}"}
     os.replace(tmp, dest)
     mb = round(os.path.getsize(dest) / 1048576, 1)
-    # o ComfyUI so enxerga o arquivo novo depois de reler a pasta
     try:
         api_get("/object_info/CheckpointLoaderSimple")
     except Exception:
