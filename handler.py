@@ -36,57 +36,80 @@ _proc = None
 
 
 # ---------------------------------------------------------------- modelos
-def link_models():
-    """Se houver network volume, liga os diretorios de modelos dele no ComfyUI."""
-    roots = [
-        "/runpod-volume/models_store",
-        "/runpod-volume/ComfyUI/models",
-        "/runpod-volume/models",
-    ]
-    root = next((r for r in roots if os.path.isdir(r)), None)
-    if not root:
-        print("[worker] sem network volume: usando os modelos da propria imagem")
-        return
-    print("[worker] usando modelos de", root)
-    dest_root = os.path.join(COMFY, "models")
-    os.makedirs(dest_root, exist_ok=True)
-    for name in sorted(os.listdir(root)):
-        src = os.path.join(root, name)
-        if not os.path.isdir(src):
-            continue
-        dst = os.path.join(dest_root, name)
+VOL_ROOTS = ("/runpod-volume/models_store",
+             "/runpod-volume/ComfyUI/models",
+             "/runpod-volume/models")
+IMG_ROOT = os.path.join(COMFY, "models")
+
+# pastas que o app usa; o ComfyUI aceita varios caminhos por chave
+MODEL_DIRS = ("checkpoints", "unet", "diffusion_models", "loras", "vae",
+              "text_encoders", "clip", "clip_vision", "controlnet",
+              "upscale_models", "embeddings", "pulid", "insightface",
+              "facerestore_models", "style_models", "gligen")
+
+
+def volume_root():
+    """Raiz de modelos no network volume, se houver um montado."""
+    for r in VOL_ROOTS:
+        if os.path.isdir(r):
+            return r
+    # volume montado mas ainda vazio: cria a raiz padrao
+    if os.path.isdir("/runpod-volume"):
         try:
-            if os.path.islink(dst):
-                continue
-            if os.path.isdir(dst) and not os.listdir(dst):
-                os.rmdir(dst)
-            if not os.path.exists(dst):
-                os.symlink(src, dst)
-                print("[worker]   ->", name)
+            os.makedirs(VOL_ROOTS[0], exist_ok=True)
+            return VOL_ROOTS[0]
         except Exception as e:
-            print("[worker]   falhou", name, e)
+            print("[worker] nao consegui criar a raiz no volume:", e)
+    return None
+
+
+def link_models():
+    """Faz o ComfyUI enxergar os modelos da imagem E os do volume ao mesmo tempo.
+
+    Antes isso era feito com symlink, e uma pasta que ja existia cheia na imagem
+    (loras, por exemplo) fazia a do volume ser ignorada. Agora escrevemos o
+    extra_model_paths.yaml, que o ComfyUI le na inicializacao e que SOMA os
+    caminhos em vez de substituir.
+    """
+    vol = volume_root()
+    cfg = os.path.join(COMFY, "extra_model_paths.yaml")
+    if not vol:
+        print("[worker] sem network volume: usando so os modelos da imagem")
+        try:
+            if os.path.exists(cfg):
+                os.remove(cfg)
+        except Exception:
+            pass
+        return
+    for name in MODEL_DIRS:
+        try:
+            os.makedirs(os.path.join(vol, name), exist_ok=True)
+        except Exception:
+            pass
+    linhas = ["volume:", "  base_path: %s" % vol, "  is_default: false"]
+    for name in MODEL_DIRS:
+        linhas.append("  %s: %s" % (name, name))
+    try:
+        with open(cfg, "w") as f:
+            f.write("\n".join(linhas) + "\n")
+        print("[worker] volume em", vol, "- modelos da imagem e do volume somados")
+    except Exception as e:
+        print("[worker] nao consegui escrever", cfg, e)
 
 
 SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def models_root():
-    for r in ("/runpod-volume/models_store",
-              "/runpod-volume/ComfyUI/models",
-              "/runpod-volume/models",
-              os.path.join(COMFY, "models")):
-        if os.path.isdir(r):
-            return r
-    return None
+    """Onde GRAVAR: o volume quando existir (persiste), senao a imagem."""
+    return volume_root() or (IMG_ROOT if os.path.isdir(IMG_ROOT) else None)
 
 
-def list_models(which=None):
-    root = models_root()
-    if not root:
-        return {"error": "nenhum diretorio de modelos encontrado"}
+def _scan(root, names):
     out = {}
-    names = [which] if isinstance(which, str) and which else sorted(os.listdir(root))
-    for name in names:
+    if not root or not os.path.isdir(root):
+        return out
+    for name in (names or sorted(os.listdir(root))):
         d = os.path.join(root, name)
         if not os.path.isdir(d):
             continue
@@ -96,10 +119,28 @@ def list_models(which=None):
             if os.path.isfile(p):
                 files.append({"name": f, "mb": round(os.path.getsize(p) / 1048576, 1)})
         out[name] = files
-    free = shutil.disk_usage(root)
-    return {"root": root, "dirs": out,
-            "free_gb": round(free.free / 1073741824, 1),
-            "total_gb": round(free.total / 1073741824, 1)}
+    return out
+
+
+def list_models(which=None):
+    """Lista a uniao dos modelos da imagem e do volume, sem repetir nomes."""
+    vol = volume_root()
+    roots = [r for r in (IMG_ROOT, vol) if r and os.path.isdir(r)]
+    if not roots:
+        return {"error": "nenhum diretorio de modelos encontrado"}
+    names = [which] if isinstance(which, str) and which else None
+    juntos = {}
+    for r in roots:
+        for pasta, arquivos in _scan(r, names).items():
+            alvo = juntos.setdefault(pasta, [])
+            ja = {x["name"] for x in alvo}
+            alvo.extend(a for a in arquivos if a["name"] not in ja)
+    for pasta in juntos:
+        juntos[pasta].sort(key=lambda x: x["name"])
+    livre = shutil.disk_usage(vol or IMG_ROOT)
+    return {"root": vol or IMG_ROOT, "volume": bool(vol), "dirs": juntos,
+            "free_gb": round(livre.free / 1073741824, 1),
+            "total_gb": round(livre.total / 1073741824, 1)}
 
 
 def download_model(spec):
@@ -140,6 +181,7 @@ def download_model(spec):
         return {"error": f"falha ao baixar: {e}"}
     os.replace(tmp, dest)
     mb = round(os.path.getsize(dest) / 1048576, 1)
+    persistente = bool(volume_root()) and dest.startswith("/runpod-volume")
     extracted = None
     if spec.get("unzip"):
         try:
@@ -160,6 +202,9 @@ def download_model(spec):
     except Exception:
         pass
     return {"ok": True, "path": dest, "mb": mb, "extracted": extracted,
+            "persistente": persistente,
+            "aviso": ("guardado no volume — fica para sempre" if persistente
+                      else "SEM volume: este arquivo some quando o worker hibernar"),
             "seconds": round(time.time() - t0, 1)}
 
 
