@@ -98,12 +98,24 @@ RUN wget -q -O checkpoints/realvisxl5.safetensors \
       $HF/SG161222/RealVisXL_V5.0/resolve/main/RealVisXL_V5.0_fp16.safetensors \
  && test -s checkpoints/realvisxl5.safetensors
 
-# 5f) LoRAs de realismo (alternativas ao boreal-v2, escolhidas no engrenagem)
+# 5f) LoRAs de realismo — varias opcoes para escolher no engrenagem e comparar
 RUN wget -q -O loras/super-realism.safetensors \
       $HF/strangerzonehf/Flux-Super-Realism-LoRA/resolve/main/super-realism.safetensors \
  && wget -q -O loras/hdr-realism.safetensors \
       $HF/prithivMLmods/Flux.1-Dev-LoRA-HDR-Realism/resolve/main/HDR.safetensors \
- && test -s loras/super-realism.safetensors && test -s loras/hdr-realism.safetensors
+ && wget -q -O loras/ultra-realism.safetensors \
+      $HF/prithivMLmods/Canopus-LoRA-Flux-UltraRealism-2.0/resolve/main/Canopus-LoRA-Flux-UltraRealism.safetensors \
+ && wget -q -O loras/face-realism.safetensors \
+      $HF/prithivMLmods/Canopus-LoRA-Flux-FaceRealism/resolve/main/Canopus-LoRA-Flux-FaceRealism.safetensors \
+ && wget -q -O loras/fine-detailed.safetensors \
+      $HF/prithivMLmods/Flux-Realism-FineDetailed/resolve/main/Flux-Realism-FineDetailed.safetensors \
+ && wget -q -O loras/koda-film.safetensors \
+      $HF/alvdansen/flux-koda/resolve/main/araminta_k_flux_koda.safetensors \
+ && wget -q -O loras/xlabs-realism.safetensors \
+      $HF/XLabs-AI/flux-RealismLora/resolve/main/lora.safetensors \
+ && for f in super-realism hdr-realism ultra-realism face-realism fine-detailed koda-film xlabs-realism; do \
+      test -s loras/$f.safetensors || exit 1; \
+    done
 
 # compatibilidade: versoes antigas do ComfyUI procuram os text encoders em models/clip
 RUN rm -rf $COMFY/models/clip && ln -s text_encoders $COMFY/models/clip
