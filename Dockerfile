@@ -1,4 +1,4 @@
-# Worker serverless RunPod — ComfyUI + FLUX + PuLID + ReActor + Wan 2.2
+# Worker serverless RunPod — ComfyUI + FLUX + PuLID + ReActor + Wan 2.2 + SDXL
 # Os modelos ficam DENTRO da imagem: o endpoint nao depende de network volume
 # e por isso pode rodar em qualquer datacenter.
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
@@ -57,7 +57,7 @@ RUN P=$COMFY/custom_nodes/ComfyUI-PuLID-Flux/pulidflux.py \
 # ---------------------------------------------------------------- modelos
 ARG HF=https://huggingface.co
 WORKDIR $COMFY/models
-RUN mkdir -p unet text_encoders vae loras pulid diffusion_models insightface facerestore_models
+RUN mkdir -p unet text_encoders vae loras pulid diffusion_models insightface facerestore_models checkpoints
 
 # 5a) FLUX (foto)
 RUN wget -q --show-progress -O unet/flux1-dev-fp8.safetensors \
@@ -92,6 +92,18 @@ RUN wget -q -O diffusion_models/wan2.2_ti2v_5B_fp16.safetensors \
       $HF/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors \
  && wget -q -O vae/wan2.2_vae.safetensors \
       $HF/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan2.2_vae.safetensors
+
+# 5e) SDXL (RealVisXL V5.0) — usado pelos geradores "Hibrido" e "RealVisXL" do app
+RUN wget -q -O checkpoints/realvisxl5.safetensors \
+      $HF/SG161222/RealVisXL_V5.0/resolve/main/RealVisXL_V5.0_fp16.safetensors \
+ && test -s checkpoints/realvisxl5.safetensors
+
+# 5f) LoRAs de realismo (alternativas ao boreal-v2, escolhidas no engrenagem)
+RUN wget -q -O loras/super-realism.safetensors \
+      $HF/strangerzonehf/Flux-Super-Realism-LoRA/resolve/main/super-realism.safetensors \
+ && wget -q -O loras/hdr-realism.safetensors \
+      $HF/prithivMLmods/Flux.1-Dev-LoRA-HDR-Realism/resolve/main/HDR.safetensors \
+ && test -s loras/super-realism.safetensors && test -s loras/hdr-realism.safetensors
 
 # compatibilidade: versoes antigas do ComfyUI procuram os text encoders em models/clip
 RUN rm -rf $COMFY/models/clip && ln -s text_encoders $COMFY/models/clip
