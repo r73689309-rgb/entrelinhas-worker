@@ -135,11 +135,10 @@ RUN mkdir -p style_models clip_vision controlnet \
       $HF/Comfy-Org/Flux1-Redux-Dev/resolve/main/flux1-redux-dev.safetensors \
  && wget -q -O clip_vision/sigclip_vision_patch14_384.safetensors \
       $HF/Comfy-Org/sigclip_vision_384/resolve/main/sigclip_vision_patch14_384.safetensors \
- && wget -q -O controlnet/flux-depth.safetensors \
-      $HF/Shakker-Labs/FLUX.1-dev-ControlNet-Depth/resolve/main/diffusion_pytorch_model.safetensors \
  && test -s style_models/flux1-redux-dev.safetensors \
- && test -s clip_vision/sigclip_vision_patch14_384.safetensors \
- && [ $(stat -c%s controlnet/flux-depth.safetensors) -gt 1000000000 ]
+ && test -s clip_vision/sigclip_vision_patch14_384.safetensors
+# O ControlNet de profundidade (3,2 GB) NAO entra na imagem: o runner do GitHub nao tem
+# disco para tanto. Ele e baixado para o network volume pelo proprio app, na pasta controlnet.
 
 # compatibilidade: versoes antigas do ComfyUI procuram os text encoders em models/clip
 RUN rm -rf $COMFY/models/clip && ln -s text_encoders $COMFY/models/clip
