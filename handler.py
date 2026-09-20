@@ -8,6 +8,12 @@ Entrada aceita:
   {"ls": "loras"}                          -> lista os arquivos de modelo disponiveis
   {"download": {"url": "...", "dir": "loras", "name": "x.safetensors"}}
                                            -> baixa um modelo para a pasta de modelos
+  {"put": {"path": "tok/img/10_tok/001.jpg", "b64": "..."}}
+                                           -> grava um arquivo na pasta de treino do volume
+  {"limpa_treino": "tok"}                  -> apaga o conjunto de treino daquela personagem
+  {"treino_estado": "tok"}                 -> quantas fotos e quantos passos ja treinados
+  {"treina": {"token":"tok","passos":400,"total":1600}}
+                                           -> treina UM pedaco e devolve o LoRA parcial
 Saida:
   {"images":[{"filename":..., "mime":..., "data":"<base64>"}], "seconds": 12.3}
 """
@@ -348,6 +354,202 @@ def delete_model(spec):
             "mb": round(mb / 1048576, 1), "free_gb": livre}
 
 
+# ---------------------------------------------------------------- treino de LoRA
+# O treino nao cabe em um job (30 min); entao ele roda em PEDACOS: cada job treina
+# alguns passos partindo do LoRA do pedaco anterior e devolve o arquivo no volume.
+# O app encadeia os pedacos e mostra o progresso.
+SD_SCRIPTS = os.environ.get("SD_SCRIPTS", "/sd-scripts")
+SAFE_REL = re.compile(r"^[A-Za-z0-9._\-/]+$")
+TOKEN_RE = re.compile(r"^[a-z0-9]{2,32}$")
+
+
+def vol_base():
+    return "/runpod-volume" if os.path.isdir("/runpod-volume") else None
+
+
+def treino_raiz():
+    b = vol_base()
+    return os.path.join(b, "treino") if b else None
+
+
+def _dentro(caminho, raiz):
+    return os.path.abspath(caminho).startswith(os.path.abspath(raiz) + os.sep)
+
+
+def put_file(spec):
+    """Recebe um pedaco de arquivo do app e grava na pasta de treino do volume."""
+    raiz = treino_raiz()
+    if not raiz:
+        return {"error": "este endpoint nao tem volume de rede: use o laboratorio"}
+    rel = (spec.get("path") or "").strip().lstrip("/")
+    if not rel or ".." in rel or not SAFE_REL.match(rel):
+        return {"error": "caminho invalido: %s" % rel}
+    dest = os.path.join(raiz, rel)
+    if not _dentro(dest, raiz):
+        return {"error": "caminho fora da pasta de treino"}
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        dados = base64.b64decode(spec.get("b64") or "")
+        with open(dest, "ab" if spec.get("append") else "wb") as f:
+            f.write(dados)
+        return {"ok": True, "path": rel, "bytes": os.path.getsize(dest)}
+    except Exception as e:
+        return {"error": "nao consegui gravar: %s" % e}
+
+
+def limpa_treino(token):
+    """Apaga o conjunto anterior daquela personagem, para nao misturar fotos."""
+    raiz = treino_raiz()
+    if not raiz:
+        return {"error": "este endpoint nao tem volume de rede: use o laboratorio"}
+    if not TOKEN_RE.match(token or ""):
+        return {"error": "palavra-chave invalida"}
+    alvo = os.path.join(raiz, token)
+    if not _dentro(alvo, raiz):
+        return {"error": "caminho fora da pasta de treino"}
+    try:
+        if os.path.isdir(alvo):
+            shutil.rmtree(alvo)
+        return {"ok": True, "apagado": token}
+    except Exception as e:
+        return {"error": "nao consegui apagar: %s" % e}
+
+
+def _acha(pasta, padroes):
+    """Procura um arquivo na imagem e no volume, na ordem dos padroes."""
+    for raiz in [r for r in (IMG_ROOT, volume_root()) if r and os.path.isdir(r)]:
+        d = os.path.join(raiz, pasta)
+        if not os.path.isdir(d):
+            continue
+        arquivos = sorted(os.listdir(d))
+        for p in padroes:
+            for f in arquivos:
+                if re.search(p, f, re.I):
+                    return os.path.join(d, f)
+    return None
+
+
+def estado_treino(token):
+    """Quantos passos ja foram treinados e qual e o ultimo arquivo."""
+    raiz = treino_raiz()
+    if not raiz or not TOKEN_RE.match(token or ""):
+        return {"error": "palavra-chave invalida"}
+    base = os.path.join(raiz, token)
+    imgs = os.path.join(base, "img", "10_" + token)
+    saida = os.path.join(base, "saida")
+    fotos = 0
+    if os.path.isdir(imgs):
+        fotos = len([f for f in os.listdir(imgs) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+    partes = []
+    if os.path.isdir(saida):
+        partes = sorted(f for f in os.listdir(saida) if f.endswith(".safetensors"))
+    feitos = 0
+    for p in partes:
+        m = re.search(r"-(\d+)\.safetensors$", p)
+        if m:
+            feitos = max(feitos, int(m.group(1)))
+    return {"ok": True, "token": token, "fotos": fotos, "passos_feitos": feitos,
+            "partes": partes, "ultimo": (partes[-1] if partes else None)}
+
+
+def treina_lora(spec):
+    """Roda UM pedaco do treino. O app chama de novo ate chegar no total."""
+    raiz = treino_raiz()
+    if not raiz:
+        return {"error": "este endpoint nao tem volume de rede: use o laboratorio"}
+    token = (spec.get("token") or "").strip().lower()
+    if not TOKEN_RE.match(token):
+        return {"error": "palavra-chave invalida (use so letras e numeros)"}
+    if not os.path.isdir(SD_SCRIPTS):
+        return {"error": "o treinador nao esta nesta imagem do worker"}
+
+    base = os.path.join(raiz, token)
+    dados = os.path.join(base, "img")
+    saida = os.path.join(base, "saida")
+    logs = os.path.join(base, "log")
+    for d in (saida, logs):
+        os.makedirs(d, exist_ok=True)
+    if not os.path.isdir(dados):
+        return {"error": "nao achei as fotos: mande o conjunto antes de treinar"}
+
+    est = estado_treino(token)
+    feitos = est.get("passos_feitos", 0)
+    passos = max(50, min(1200, int(spec.get("passos") or 400)))
+    total = max(passos, min(6000, int(spec.get("total") or 1600)))
+    if feitos >= total:
+        return {"ok": True, "pronto": True, "passos_feitos": feitos, "arquivo": est.get("ultimo")}
+    passos = min(passos, total - feitos)
+
+    unet = _acha("unet", [r"flux.*dev.*fp8", r"flux.*dev", r"flux"]) or _acha("diffusion_models", [r"flux"])
+    clip_l = _acha("text_encoders", [r"^clip_l"]) or _acha("clip", [r"^clip_l"])
+    t5 = _acha("text_encoders", [r"t5xxl.*fp8", r"t5xxl"]) or _acha("clip", [r"t5xxl"])
+    ae = _acha("vae", [r"^ae\.", r"flux.*vae", r"ae"])
+    faltam = [n for n, v in (("unet FLUX", unet), ("clip_l", clip_l), ("t5xxl", t5), ("vae ae", ae)) if not v]
+    if faltam:
+        return {"error": "faltam arquivos para treinar: " + ", ".join(faltam)}
+
+    anterior = est.get("ultimo")
+    nome = "%s-%06d" % (token, feitos + passos)
+    cmd = [
+        "accelerate", "launch", "--num_cpu_threads_per_process", "2",
+        "--num_processes", "1", "--num_machines", "1", "--mixed_precision", "bf16",
+        "--dynamo_backend", "no",
+        os.path.join(SD_SCRIPTS, "flux_train_network.py"),
+        "--pretrained_model_name_or_path", unet,
+        "--clip_l", clip_l, "--t5xxl", t5, "--ae", ae,
+        "--train_data_dir", dados,
+        "--output_dir", saida, "--output_name", nome, "--logging_dir", logs,
+        "--save_model_as", "safetensors", "--save_precision", "bf16",
+        "--mixed_precision", "bf16", "--sdpa", "--gradient_checkpointing",
+        "--network_module", "networks.lora_flux",
+        "--network_dim", str(max(4, min(64, int(spec.get("dim") or 16)))),
+        "--optimizer_type", "adafactor",
+        "--optimizer_args", "relative_step=False", "scale_parameter=False", "warmup_init=False",
+        "--lr_scheduler", "constant_with_warmup", "--lr_warmup_steps", "10",
+        "--max_grad_norm", "0.0",
+        "--learning_rate", str(spec.get("lr") or "1e-4"),
+        "--max_train_steps", str(passos),
+        "--train_batch_size", "1",
+        "--resolution", str(spec.get("res") or "1024,1024"),
+        "--enable_bucket", "--min_bucket_reso", "512", "--max_bucket_reso", "1536",
+        "--cache_latents", "--cache_latents_to_disk",
+        "--cache_text_encoder_outputs", "--cache_text_encoder_outputs_to_disk",
+        "--fp8_base", "--highvram", "--seed", "42",
+        "--timestep_sampling", "shift", "--discrete_flow_shift", "3.1582",
+        "--model_prediction_type", "raw", "--guidance_scale", "1.0",
+        "--save_every_n_steps", "100000",
+    ]
+    if anterior:
+        cmd += ["--network_weights", os.path.join(saida, anterior)]
+
+    t0 = time.time()
+    try:
+        p = subprocess.run(cmd, cwd=SD_SCRIPTS, capture_output=True, text=True,
+                           timeout=max(120, int(spec.get("limite") or 1500)))
+    except subprocess.TimeoutExpired:
+        return {"error": "o pedaco passou do tempo do job: diminua os passos por pedaco"}
+    cauda = ((p.stdout or "")[-1500:] + "\n" + (p.stderr or "")[-2500:]).strip()
+    arq = os.path.join(saida, nome + ".safetensors")
+    if p.returncode != 0 or not os.path.isfile(arq):
+        return {"error": "o treino falhou", "detail": cauda}
+
+    # o arquivo pronto vai para a pasta de LoRAs, onde o app ja sabe procurar
+    copiado = None
+    try:
+        destino_dir = os.path.join(models_root() or "", "loras")
+        os.makedirs(destino_dir, exist_ok=True)
+        copiado = token + ".safetensors"
+        shutil.copyfile(arq, os.path.join(destino_dir, copiado))
+    except Exception:
+        copiado = None
+
+    novo = estado_treino(token)
+    return {"ok": True, "pronto": novo.get("passos_feitos", 0) >= total,
+            "passos_feitos": novo.get("passos_feitos", 0), "total": total,
+            "arquivo": nome + ".safetensors", "lora": copiado,
+            "segundos": round(time.time() - t0, 1), "log": cauda[-600:]}
+
+
 # ---------------------------------------------------------------- handler
 def handler(job):
     inp = job.get("input") or {}
@@ -361,6 +563,18 @@ def handler(job):
 
     if inp.get("delete"):
         return delete_model(inp["delete"])
+
+    if inp.get("put"):
+        return put_file(inp["put"])
+
+    if inp.get("limpa_treino"):
+        return limpa_treino(inp["limpa_treino"])
+
+    if inp.get("treino_estado"):
+        return estado_treino(inp["treino_estado"])
+
+    if inp.get("treina"):
+        return treina_lora(inp["treina"])
 
     start_comfy()
 
