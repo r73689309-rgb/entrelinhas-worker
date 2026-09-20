@@ -38,6 +38,9 @@ RUN pip install "numpy<2" cython \
 WORKDIR $COMFY/custom_nodes
 RUN git clone --depth 1 https://github.com/balazik/ComfyUI-PuLID-Flux.git \
  && git clone --depth 1 https://github.com/Gourieff/ComfyUI-ReActor.git \
+ && git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Impact-Pack.git \
+ && git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git \
+ && git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git \
  && for d in */ ; do \
       if [ -f "$d/requirements.txt" ]; then \
         grep -viE '^(torch|torchvision|torchaudio|onnxruntime|insightface|numpy)([=<>~]|$)' "$d/requirements.txt" > /tmp/n.txt || true; \
@@ -116,6 +119,27 @@ RUN wget -q -O loras/super-realism.safetensors \
  && for f in super-realism hdr-realism ultra-realism face-realism fine-detailed koda-film xlabs-realism; do \
       test -s loras/$f.safetensors || exit 1; \
     done
+
+# 5g) Detectores do Impact Pack — usados para refazer rosto e maos em alta resolucao
+RUN mkdir -p ultralytics/bbox ultralytics/segm \
+ && wget -q -O ultralytics/bbox/face_yolov8m.pt $HF/Bingsu/adetailer/resolve/main/face_yolov8m.pt \
+ && wget -q -O ultralytics/bbox/hand_yolov8s.pt $HF/Bingsu/adetailer/resolve/main/hand_yolov8s.pt \
+ && test -s ultralytics/bbox/face_yolov8m.pt \
+ && test -s ultralytics/bbox/hand_yolov8s.pt
+
+# 5h) Conserto do CORPO: Redux (injeta a aparencia da foto de referencia na geracao,
+#     como o PuLID faz com o rosto, mas para o corpo inteiro) + ControlNet de profundidade
+#     (fixa a silhueta) + o CLIP Vision que o Redux usa para ler a foto.
+RUN mkdir -p style_models clip_vision controlnet \
+ && wget -q -O style_models/flux1-redux-dev.safetensors \
+      $HF/Comfy-Org/Flux1-Redux-Dev/resolve/main/flux1-redux-dev.safetensors \
+ && wget -q -O clip_vision/sigclip_vision_patch14_384.safetensors \
+      $HF/Comfy-Org/sigclip_vision_384/resolve/main/sigclip_vision_patch14_384.safetensors \
+ && wget -q -O controlnet/flux-depth.safetensors \
+      $HF/Shakker-Labs/FLUX.1-dev-ControlNet-Depth/resolve/main/diffusion_pytorch_model.safetensors \
+ && test -s style_models/flux1-redux-dev.safetensors \
+ && test -s clip_vision/sigclip_vision_patch14_384.safetensors \
+ && [ $(stat -c%s controlnet/flux-depth.safetensors) -gt 1000000000 ]
 
 # compatibilidade: versoes antigas do ComfyUI procuram os text encoders em models/clip
 RUN rm -rf $COMFY/models/clip && ln -s text_encoders $COMFY/models/clip
