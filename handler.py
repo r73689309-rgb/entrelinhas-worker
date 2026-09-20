@@ -45,7 +45,7 @@ IMG_ROOT = os.path.join(COMFY, "models")
 MODEL_DIRS = ("checkpoints", "unet", "diffusion_models", "loras", "vae",
               "text_encoders", "clip", "clip_vision", "controlnet",
               "upscale_models", "embeddings", "pulid", "insightface",
-              "facerestore_models", "style_models", "gligen")
+              "facerestore_models", "style_models", "gligen", "ultralytics")
 
 
 def volume_root():
@@ -306,6 +306,48 @@ def collect(history_entry):
     return out
 
 
+def delete_model(spec):
+    """Remove um arquivo de modelo. So dentro das pastas conhecidas, so no volume
+    (o que esta na imagem volta no proximo worker, entao apagar nao adianta)."""
+    vol = volume_root()
+    if not vol:
+        return {"error": "sem network volume: nada para apagar aqui"}
+    sub = (spec.get("dir") or "").strip()
+    name = (spec.get("name") or "").strip()
+    if sub not in MODEL_DIRS:
+        return {"error": "pasta desconhecida: %s" % sub}
+    if not SAFE.match(name or "x"):
+        return {"error": "nome de arquivo invalido"}
+    alvo = os.path.realpath(os.path.join(vol, sub, name))
+    raiz = os.path.realpath(os.path.join(vol, sub))
+    # trava: o caminho final tem que continuar dentro da pasta de modelos
+    if not alvo.startswith(raiz + os.sep):
+        return {"error": "caminho fora da pasta de modelos"}
+    if not os.path.exists(alvo):
+        return {"error": "nao encontrei %s em %s (talvez esteja na imagem, e nao no volume)" % (name, sub)}
+    mb = 0
+    try:
+        if os.path.isdir(alvo):
+            import shutil
+            for r, _, fs in os.walk(alvo):
+                for x in fs:
+                    try: mb += os.path.getsize(os.path.join(r, x))
+                    except Exception: pass
+            shutil.rmtree(alvo)
+        else:
+            mb = os.path.getsize(alvo)
+            os.remove(alvo)
+    except Exception as e:
+        return {"error": "nao consegui apagar: %s" % e}
+    livre = 0
+    try:
+        st = os.statvfs(vol); livre = round(st.f_bavail * st.f_frsize / (1024 ** 3), 1)
+    except Exception:
+        pass
+    return {"ok": True, "apagado": name, "dir": sub,
+            "mb": round(mb / 1048576, 1), "free_gb": livre}
+
+
 # ---------------------------------------------------------------- handler
 def handler(job):
     inp = job.get("input") or {}
@@ -316,6 +358,9 @@ def handler(job):
 
     if inp.get("download"):
         return download_model(inp["download"])
+
+    if inp.get("delete"):
+        return delete_model(inp["delete"])
 
     start_comfy()
 
