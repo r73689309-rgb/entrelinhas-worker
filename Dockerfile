@@ -143,6 +143,14 @@ RUN mkdir -p style_models clip_vision controlnet \
 # compatibilidade: versoes antigas do ComfyUI procuram os text encoders em models/clip
 RUN rm -rf $COMFY/models/clip && ln -s text_encoders $COMFY/models/clip
 
+# 5i) Treinador de LoRA (kohya sd-scripts, ramo sd3 = suporte a FLUX).
+# Ele reaproveita os modelos que ja estao aqui (FLUX, clip_l, t5xxl, ae), entao
+# nao baixa nada grande: e so o programa e algumas bibliotecas de apoio.
+RUN git clone -b sd3 --depth 1 https://github.com/kohya-ss/sd-scripts.git /sd-scripts \
+ && pip install --no-cache-dir accelerate transformers safetensors sentencepiece \
+      ftfy toml voluptuous einops imagesize rich pytorch-lightning \
+ && python -c "import os;assert os.path.isfile('/sd-scripts/flux_train_network.py')"
+
 # 6) SDK do runpod + handler
 RUN pip install runpod requests
 WORKDIR /
