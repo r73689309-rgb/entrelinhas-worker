@@ -16,7 +16,7 @@ Entrada aceita:
   {"treino_estado": "tok"}                 -> quantas fotos e quantos passos ja treinados
   {"treina": {"token":"tok","passos":400,"total":1600,"base":"flux|sdxl"}}
                                            -> treina UM pedaco e devolve o LoRA parcial
-  {"publicar": {"token":"<hf>","repo":"user/loras","nome":"tok.safetensors"}}
+  {"publicar": {"token":"<hf>","repo":"user/loras","nome":"tok.safetensors","pasta":"tok_xl"}}
                                            -> sobe o LoRA para um repo privado do HF
 Saida:
   {"images":[{"filename":..., "mime":..., "data":"<base64>"}], "seconds": 12.3}
@@ -632,20 +632,30 @@ def publica_lora(spec):
     if not SAFE.match(nome or "x"):
         return {"error": "nome de arquivo invalido"}
 
-    # procura o arquivo: primeiro na pasta de loras, depois na saida do treino
+    # Onde procurar. O nome do arquivo NAO diz a pasta do treino: um ponto
+    # intermediario chama-se "tok-000800.safetensors" e o LoRA de SDXL chama-se
+    # "tok-xl.safetensors", mas os dois moram em "tok" ou "tok_xl". Entao o app
+    # manda a pasta em "pasta"; sem ela, tentamos as derivacoes conhecidas.
     candidatos = []
     root = models_root()
     if root:
         candidatos.append(os.path.join(root, "loras", nome))
     raiz = treino_raiz()
     if raiz:
-        tok = nome.split(".")[0]
-        candidatos.append(os.path.join(raiz, tok, "saida", nome))
-        d = os.path.join(raiz, tok, "saida")
-        if os.path.isdir(d):
-            for f in sorted(os.listdir(d)):
-                if f.endswith(".safetensors"):
-                    candidatos.append(os.path.join(d, f))
+        base_nome = re.sub(r"\.safetensors$", "", nome, flags=re.I)
+        tok = re.sub(r"(-\d{4,6}|-xl)$", "", base_nome)
+        pastas = []
+        for cand in ((spec.get("pasta") or "").strip().lower(), tok + "_xl", tok, base_nome):
+            cand = _pasta(cand)
+            if cand and cand not in pastas:
+                pastas.append(cand)
+        for pst in pastas:
+            d = os.path.join(raiz, pst, "saida")
+            candidatos.append(os.path.join(d, nome))
+            if os.path.isdir(d):
+                for f in sorted(os.listdir(d)):
+                    if f.endswith(".safetensors"):
+                        candidatos.append(os.path.join(d, f))
     arq = next((c for c in candidatos if os.path.isfile(c)), None)
     if not arq:
         return {"error": "nao achei o arquivo %s para publicar" % nome}
@@ -672,7 +682,7 @@ def publica_lora(spec):
         # nunca devolver o token em mensagem de erro
         saida = saida.replace(token, "<token>")
         return {"error": "o Hugging Face recusou", "detail": saida[-1200:]}
-    return {"ok": True, "repo": repo, "nome": nome,
+    return {"ok": True, "repo": repo, "nome": nome, "origem": arq,
             "url": "https://huggingface.co/%s/resolve/main/%s" % (repo, nome),
             "mb": round(os.path.getsize(arq) / 1048576, 1)}
 
