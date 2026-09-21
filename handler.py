@@ -14,6 +14,8 @@ Entrada aceita:
   {"treino_estado": "tok"}                 -> quantas fotos e quantos passos ja treinados
   {"treina": {"token":"tok","passos":400,"total":1600}}
                                            -> treina UM pedaco e devolve o LoRA parcial
+  {"publicar": {"token":"<hf>","repo":"user/loras","nome":"tok.safetensors"}}
+                                           -> sobe o LoRA para um repo privado do HF
 Saida:
   {"images":[{"filename":..., "mime":..., "data":"<base64>"}], "seconds": 12.3}
 """
@@ -552,6 +554,67 @@ def treina_lora(spec):
             "segundos": round(time.time() - t0, 1), "log": cauda[-600:]}
 
 
+def publica_lora(spec):
+    """Sobe um LoRA treinado para um repositorio PRIVADO do Hugging Face.
+
+    E assim que o arquivo sai do volume do laboratorio e fica ao alcance da
+    producao, que nao tem volume: ela baixa por HTTP quando precisa.
+    """
+    token = (spec.get("token") or "").strip()
+    repo = (spec.get("repo") or "").strip()
+    nome = (spec.get("nome") or "").strip()
+    if not token:
+        return {"error": "falta o token de escrita do Hugging Face"}
+    if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", repo or ""):
+        return {"error": "repositorio invalido: use usuario/nome"}
+    if not SAFE.match(nome or "x"):
+        return {"error": "nome de arquivo invalido"}
+
+    # procura o arquivo: primeiro na pasta de loras, depois na saida do treino
+    candidatos = []
+    root = models_root()
+    if root:
+        candidatos.append(os.path.join(root, "loras", nome))
+    raiz = treino_raiz()
+    if raiz:
+        tok = nome.split(".")[0]
+        candidatos.append(os.path.join(raiz, tok, "saida", nome))
+        d = os.path.join(raiz, tok, "saida")
+        if os.path.isdir(d):
+            for f in sorted(os.listdir(d)):
+                if f.endswith(".safetensors"):
+                    candidatos.append(os.path.join(d, f))
+    arq = next((c for c in candidatos if os.path.isfile(c)), None)
+    if not arq:
+        return {"error": "nao achei o arquivo %s para publicar" % nome}
+
+    py = "/sd-venv/bin/python" if os.path.isfile("/sd-venv/bin/python") else sys.executable
+    script = (
+        "import os\n"
+        "from huggingface_hub import HfApi\n"
+        "api=HfApi(token=os.environ['HF_TOKEN'])\n"
+        "api.create_repo(repo_id=os.environ['REPO'], private=True, exist_ok=True)\n"
+        "api.upload_file(path_or_fileobj=os.environ['ARQ'],"
+        " path_in_repo=os.environ['NOME'], repo_id=os.environ['REPO'])\n"
+        "print('ok')\n"
+    )
+    env = dict(os.environ)
+    env.update({"HF_TOKEN": token, "REPO": repo, "NOME": nome, "ARQ": arq})
+    try:
+        p = subprocess.run([py, "-c", script], capture_output=True, text=True,
+                           timeout=900, env=env)
+    except subprocess.TimeoutExpired:
+        return {"error": "a publicacao passou do tempo"}
+    if p.returncode != 0:
+        saida = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
+        # nunca devolver o token em mensagem de erro
+        saida = saida.replace(token, "<token>")
+        return {"error": "o Hugging Face recusou", "detail": saida[-1200:]}
+    return {"ok": True, "repo": repo, "nome": nome,
+            "url": "https://huggingface.co/%s/resolve/main/%s" % (repo, nome),
+            "mb": round(os.path.getsize(arq) / 1048576, 1)}
+
+
 # ---------------------------------------------------------------- handler
 def handler(job):
     inp = job.get("input") or {}
@@ -577,6 +640,9 @@ def handler(job):
 
     if inp.get("treina"):
         return treina_lora(inp["treina"])
+
+    if inp.get("publicar"):
+        return publica_lora(inp["publicar"])
 
     start_comfy()
 
