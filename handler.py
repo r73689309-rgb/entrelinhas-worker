@@ -14,7 +14,7 @@ Entrada aceita:
                                            -> grava um arquivo na pasta de treino do volume
   {"limpa_treino": "tok"}                  -> apaga o conjunto de treino daquela personagem
   {"treino_estado": "tok"}                 -> quantas fotos e quantos passos ja treinados
-  {"treina": {"token":"tok","passos":400,"total":1600}}
+  {"treina": {"token":"tok","passos":400,"total":1600,"base":"flux|sdxl"}}
                                            -> treina UM pedaco e devolve o LoRA parcial
   {"publicar": {"token":"<hf>","repo":"user/loras","nome":"tok.safetensors"}}
                                            -> sobe o LoRA para um repo privado do HF
@@ -365,6 +365,19 @@ def delete_model(spec):
 SD_SCRIPTS = os.environ.get("SD_SCRIPTS", "/sd-scripts")
 SAFE_REL = re.compile(r"^[A-Za-z0-9._\-/]+$")
 TOKEN_RE = re.compile(r"^[a-z0-9]{2,32}$")
+# A pasta no volume pode diferir da palavra-chave: a mesma personagem pode ter
+# um treino de FLUX e um de SDXL, e misturar os dois quebra a continuacao.
+PASTA_RE = re.compile(r"^[a-z0-9]{2,32}(_xl)?$")
+
+
+def _pasta(spec_ou_token, base=None):
+    if isinstance(spec_ou_token, dict):
+        p = (spec_ou_token.get("pasta") or spec_ou_token.get("token") or "").strip().lower()
+    else:
+        p = (spec_ou_token or "").strip().lower()
+    if base == "sdxl" and not p.endswith("_xl"):
+        p += "_xl"
+    return p if PASTA_RE.match(p) else ""
 
 
 def vol_base():
@@ -406,7 +419,8 @@ def limpa_treino(token):
     raiz = treino_raiz()
     if not raiz:
         return {"error": "este endpoint nao tem volume de rede: use o laboratorio"}
-    if not TOKEN_RE.match(token or ""):
+    token = _pasta(token)
+    if not token:
         return {"error": "palavra-chave invalida"}
     alvo = os.path.join(raiz, token)
     if not _dentro(alvo, raiz):
@@ -417,6 +431,19 @@ def limpa_treino(token):
         return {"ok": True, "apagado": token}
     except Exception as e:
         return {"error": "nao consegui apagar: %s" % e}
+
+
+def _acha_ckpt(pref=""):
+    """O checkpoint SDXL (RealVisXL) usado para treinar LoRA de SDXL."""
+    pads = []
+    if pref:
+        pads.append(re.escape(pref))
+    pads += [r"realvis", r"\.safetensors$"]
+    for pasta in ("checkpoints", "Stable-diffusion"):
+        a = _acha(pasta, pads)
+        if a:
+            return a
+    return None
 
 
 def _acha(pasta, padroes):
@@ -436,7 +463,8 @@ def _acha(pasta, padroes):
 def estado_treino(token):
     """Quantos passos ja foram treinados e qual e o ultimo arquivo."""
     raiz = treino_raiz()
-    if not raiz or not TOKEN_RE.match(token or ""):
+    token = _pasta(token)
+    if not raiz or not token:
         return {"error": "palavra-chave invalida"}
     base = os.path.join(raiz, token)
     imgs = os.path.join(base, "img", "10_" + token)
@@ -467,7 +495,13 @@ def treina_lora(spec):
     if not os.path.isdir(SD_SCRIPTS):
         return {"error": "o treinador nao esta nesta imagem do worker"}
 
-    base = os.path.join(raiz, token)
+    base_treino = (spec.get("base") or "flux").strip().lower()
+    if base_treino not in ("flux", "sdxl"):
+        base_treino = "flux"
+    pasta = _pasta(spec, base_treino)
+    if not pasta:
+        return {"error": "pasta de treino invalida"}
+    base = os.path.join(raiz, pasta)
     dados = os.path.join(base, "img")
     saida = os.path.join(base, "saida")
     logs = os.path.join(base, "log")
@@ -476,7 +510,7 @@ def treina_lora(spec):
     if not os.path.isdir(dados):
         return {"error": "nao achei as fotos: mande o conjunto antes de treinar"}
 
-    est = estado_treino(token)
+    est = estado_treino(pasta)
     feitos = est.get("passos_feitos", 0)
     passos = max(50, min(1200, int(spec.get("passos") or 400)))
     total = max(passos, min(6000, int(spec.get("total") or 1600)))
@@ -484,47 +518,73 @@ def treina_lora(spec):
         return {"ok": True, "pronto": True, "passos_feitos": feitos, "arquivo": est.get("ultimo")}
     passos = min(passos, total - feitos)
 
-    unet = _acha("unet", [r"flux.*dev.*fp8", r"flux.*dev", r"flux"]) or _acha("diffusion_models", [r"flux"])
-    clip_l = _acha("text_encoders", [r"^clip_l"]) or _acha("clip", [r"^clip_l"])
-    t5 = _acha("text_encoders", [r"t5xxl.*fp8", r"t5xxl"]) or _acha("clip", [r"t5xxl"])
-    ae = _acha("vae", [r"^ae\.", r"flux.*vae", r"ae"])
-    faltam = [n for n, v in (("unet FLUX", unet), ("clip_l", clip_l), ("t5xxl", t5), ("vae ae", ae)) if not v]
-    if faltam:
-        return {"error": "faltam arquivos para treinar: " + ", ".join(faltam)}
+    # Duas bases possiveis. FLUX: 4 arquivos soltos (unet, clip_l, t5, ae) e
+    # networks.lora_flux. SDXL: um unico checkpoint e networks.lora — mais
+    # barato de treinar e com prompt negativo de verdade na hora de gerar.
+    if base_treino == "sdxl":
+        ckpt = _acha_ckpt((spec.get("ckpt") or "").strip())
+        if not ckpt:
+            return {"error": "nao achei um checkpoint SDXL (RealVisXL) neste worker: "
+                             "instale o modelo antes de treinar"}
+    else:
+        unet = _acha("unet", [r"flux.*dev.*fp8", r"flux.*dev", r"flux"]) or _acha("diffusion_models", [r"flux"])
+        clip_l = _acha("text_encoders", [r"^clip_l"]) or _acha("clip", [r"^clip_l"])
+        t5 = _acha("text_encoders", [r"t5xxl.*fp8", r"t5xxl"]) or _acha("clip", [r"t5xxl"])
+        ae = _acha("vae", [r"^ae\.", r"flux.*vae", r"ae"])
+        faltam = [n for n, v in (("unet FLUX", unet), ("clip_l", clip_l), ("t5xxl", t5), ("vae ae", ae)) if not v]
+        if faltam:
+            return {"error": "faltam arquivos para treinar: " + ", ".join(faltam)}
 
     anterior = est.get("ultimo")
     nome = "%s-%06d" % (token, feitos + passos)
     # o treinador roda no ambiente proprio dele quando existir (venv /sd-venv)
     acc = "/sd-venv/bin/accelerate" if os.path.isfile("/sd-venv/bin/accelerate") else "accelerate"
+    script = "sdxl_train_network.py" if base_treino == "sdxl" else "flux_train_network.py"
     cmd = [
         acc, "launch", "--num_cpu_threads_per_process", "2",
         "--num_processes", "1", "--num_machines", "1", "--mixed_precision", "bf16",
         "--dynamo_backend", "no",
-        os.path.join(SD_SCRIPTS, "flux_train_network.py"),
-        "--pretrained_model_name_or_path", unet,
-        "--clip_l", clip_l, "--t5xxl", t5, "--ae", ae,
+        os.path.join(SD_SCRIPTS, script),
+    ]
+    if base_treino == "sdxl":
+        cmd += ["--pretrained_model_name_or_path", ckpt]
+    else:
+        cmd += ["--pretrained_model_name_or_path", unet,
+                "--clip_l", clip_l, "--t5xxl", t5, "--ae", ae]
+    cmd += [
         "--train_data_dir", dados,
         "--output_dir", saida, "--output_name", nome, "--logging_dir", logs,
         "--save_model_as", "safetensors", "--save_precision", "bf16",
         "--mixed_precision", "bf16", "--sdpa", "--gradient_checkpointing",
-        "--network_module", "networks.lora_flux",
+        "--network_module", ("networks.lora" if base_treino == "sdxl" else "networks.lora_flux"),
         "--network_dim", str(max(4, min(64, int(spec.get("dim") or 16)))),
         "--optimizer_type", "adafactor",
         "--optimizer_args", "relative_step=False", "scale_parameter=False", "warmup_init=False",
         "--lr_scheduler", "constant_with_warmup", "--lr_warmup_steps", "10",
-        "--max_grad_norm", "0.0",
         "--learning_rate", str(spec.get("lr") or "1e-4"),
         "--max_train_steps", str(passos),
         "--train_batch_size", "1",
         "--resolution", str(spec.get("res") or "1024,1024"),
         "--enable_bucket", "--min_bucket_reso", "512", "--max_bucket_reso", "1536",
         "--cache_latents", "--cache_latents_to_disk",
-        "--cache_text_encoder_outputs", "--cache_text_encoder_outputs_to_disk",
-        "--fp8_base", "--highvram", "--seed", "42",
-        "--timestep_sampling", "shift", "--discrete_flow_shift", "3.1582",
-        "--model_prediction_type", "raw", "--guidance_scale", "1.0",
+        "--seed", "42",
+        "--max_grad_norm", ("1.0" if base_treino == "sdxl" else "0.0"),
         "--save_every_n_steps", "100000",
     ]
+    if base_treino == "sdxl":
+        # No SDXL o codificador de texto treina junto: e o que faz a palavra-chave
+        # grudar na personagem. Isso e incompativel com o cache do text encoder,
+        # entao aqui ele NAO entra (no FLUX entra, e o T5 fica congelado).
+        cmd += ["--no_half_vae", "--min_snr_gamma", "5",
+                "--text_encoder_lr", str(spec.get("telr") or "5e-5"),
+                "--unet_lr", str(spec.get("lr") or "1e-4"),
+                "--noise_offset", "0.03",
+                "--clip_skip", "1"]
+    else:
+        cmd += ["--cache_text_encoder_outputs", "--cache_text_encoder_outputs_to_disk",
+                "--fp8_base", "--highvram",
+                "--timestep_sampling", "shift", "--discrete_flow_shift", "3.1582",
+                "--model_prediction_type", "raw", "--guidance_scale", "1.0"]
     if anterior:
         cmd += ["--network_weights", os.path.join(saida, anterior)]
 
@@ -544,15 +604,15 @@ def treina_lora(spec):
     try:
         destino_dir = os.path.join(models_root() or "", "loras")
         os.makedirs(destino_dir, exist_ok=True)
-        copiado = token + ".safetensors"
+        copiado = (token + "-xl.safetensors") if base_treino == "sdxl" else (token + ".safetensors")
         shutil.copyfile(arq, os.path.join(destino_dir, copiado))
     except Exception:
         copiado = None
 
-    novo = estado_treino(token)
+    novo = estado_treino(pasta)
     return {"ok": True, "pronto": novo.get("passos_feitos", 0) >= total,
             "passos_feitos": novo.get("passos_feitos", 0), "total": total,
-            "arquivo": nome + ".safetensors", "lora": copiado,
+            "arquivo": nome + ".safetensors", "lora": copiado, "base": base_treino,
             "segundos": round(time.time() - t0, 1), "log": cauda[-600:]}
 
 
