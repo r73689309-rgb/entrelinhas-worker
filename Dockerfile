@@ -148,7 +148,8 @@ RUN rm -rf $COMFY/models/clip && ln -s text_encoders $COMFY/models/clip
 # nao baixa nada grande: e so o programa e algumas bibliotecas de apoio.
 RUN git clone -b sd3 --depth 1 https://github.com/kohya-ss/sd-scripts.git /sd-scripts \
  && pip install --no-cache-dir accelerate transformers safetensors sentencepiece \
-      ftfy toml voluptuous einops imagesize rich pytorch-lightning \
+      ftfy toml voluptuous einops imagesize rich huggingface-hub \
+      diffusers==0.32.1 opencv-python-headless \
  && python -c "import os;assert os.path.isfile('/sd-scripts/flux_train_network.py')"
 
 # 6) SDK do runpod + handler
