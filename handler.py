@@ -4,6 +4,8 @@ Handler serverless para ComfyUI (RunPod).
 Entrada aceita:
   {"workflow": {...}}                      -> executa o workflow em formato API
   {"workflow": {...}, "images": [ {"name":"ref.png","image":"<base64>"} ]}
+  {"workflow": {...}, "loras": [ {"url":"https://...","name":"tok.safetensors","token":"<hf>"} ]}
+                                           -> garante o LoRA no MESMO worker antes de gerar
   {"get": "/object_info"}                  -> proxy GET para a API do ComfyUI
   {"ls": "loras"}                          -> lista os arquivos de modelo disponiveis
   {"download": {"url": "...", "dir": "loras", "name": "x.safetensors"}}
@@ -652,6 +654,18 @@ def handler(job):
     wf = inp.get("workflow") or inp.get("prompt")
     if not wf:
         return {"error": "faltou o campo 'workflow'"}
+
+    # LoRAs da personagem: baixados AQUI, no mesmo worker que vai gerar.
+    # (baixar num job separado nao serve: o proximo job pode cair em outro worker)
+    for lr in inp.get("loras") or []:
+        try:
+            r = download_model({"url": lr.get("url"), "dir": "loras",
+                                "name": lr.get("name"), "token": lr.get("token")})
+            if r.get("error"):
+                return {"error": "nao consegui trazer o LoRA %s: %s"
+                                 % (lr.get("name"), r["error"])}
+        except Exception as e:
+            return {"error": "falha ao trazer o LoRA %s: %s" % (lr.get("name"), e)}
 
     for img in inp.get("images") or []:
         try:
