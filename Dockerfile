@@ -150,6 +150,8 @@ RUN rm -rf $COMFY/models/clip && ln -s text_encoders $COMFY/models/clip
 # Em vez de trocar as do sistema (e arriscar quebrar a geracao de fotos), ele ganha um
 # ambiente proprio que REAPROVEITA o torch do sistema e so fixa as bibliotecas dele.
 RUN git clone -b sd3 --depth 1 https://github.com/kohya-ss/sd-scripts.git /sd-scripts \
+ && apt-get update && apt-get install -y --no-install-recommends python3.10-venv \
+ && rm -rf /var/lib/apt/lists/* \
  && python -m venv --system-site-packages /sd-venv \
  && /sd-venv/bin/pip install --no-cache-dir --upgrade pip \
  && /sd-venv/bin/pip install --no-cache-dir \
