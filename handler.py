@@ -490,8 +490,10 @@ def treina_lora(spec):
 
     anterior = est.get("ultimo")
     nome = "%s-%06d" % (token, feitos + passos)
+    # o treinador roda no ambiente proprio dele quando existir (venv /sd-venv)
+    acc = "/sd-venv/bin/accelerate" if os.path.isfile("/sd-venv/bin/accelerate") else "accelerate"
     cmd = [
-        "accelerate", "launch", "--num_cpu_threads_per_process", "2",
+        acc, "launch", "--num_cpu_threads_per_process", "2",
         "--num_processes", "1", "--num_machines", "1", "--mixed_precision", "bf16",
         "--dynamo_backend", "no",
         os.path.join(SD_SCRIPTS, "flux_train_network.py"),
