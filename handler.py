@@ -14,7 +14,7 @@ Entrada aceita:
                                            -> grava um arquivo na pasta de treino do volume
   {"limpa_treino": "tok"}                  -> apaga o conjunto de treino daquela personagem
   {"treino_estado": "tok"}                 -> quantas fotos e quantos passos ja treinados
-  {"treina": {"token":"tok","passos":400,"total":1600,"base":"flux|sdxl"}}
+  {"treina": {"token":"tok","passos":400,"total":1600,"base":"flux|sdxl","dim":16,"alpha":16}}
                                            -> treina UM pedaco e devolve o LoRA parcial
   {"publicar": {"token":"<hf>","repo":"user/loras","nome":"tok.safetensors","pasta":"tok_xl"}}
                                            -> sobe o LoRA para um repo privado do HF
@@ -539,6 +539,7 @@ def treina_lora(spec):
     nome = "%s-%06d" % (token, feitos + passos)
     # o treinador roda no ambiente proprio dele quando existir (venv /sd-venv)
     acc = "/sd-venv/bin/accelerate" if os.path.isfile("/sd-venv/bin/accelerate") else "accelerate"
+    dim = max(4, min(64, int(spec.get("dim") or 16)))
     script = "sdxl_train_network.py" if base_treino == "sdxl" else "flux_train_network.py"
     cmd = [
         acc, "launch", "--num_cpu_threads_per_process", "2",
@@ -557,7 +558,12 @@ def treina_lora(spec):
         "--save_model_as", "safetensors", "--save_precision", "bf16",
         "--mixed_precision", "bf16", "--sdpa", "--gradient_checkpointing",
         "--network_module", ("networks.lora" if base_treino == "sdxl" else "networks.lora_flux"),
-        "--network_dim", str(max(4, min(64, int(spec.get("dim") or 16)))),
+        "--network_dim", str(dim),
+        # Sem --network_alpha o kohya usa 1. Com dim 16 isso escala a LoRA em
+        # 1/16 E faz o otimizador compensar com pesos enormes: a LoRA colapsa
+        # numa unica imagem memorizada (mesmo rosto, mesma pose, prompt ignorado).
+        # alpha = dim e a escolha neutra: escala 1, treino estavel.
+        "--network_alpha", str(max(1, min(dim, int(spec.get("alpha") or dim)))),
         "--optimizer_type", "adafactor",
         "--optimizer_args", "relative_step=False", "scale_parameter=False", "warmup_init=False",
         "--lr_scheduler", "constant_with_warmup", "--lr_warmup_steps", "10",
