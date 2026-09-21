@@ -146,10 +146,19 @@ RUN rm -rf $COMFY/models/clip && ln -s text_encoders $COMFY/models/clip
 # 5i) Treinador de LoRA (kohya sd-scripts, ramo sd3 = suporte a FLUX).
 # Ele reaproveita os modelos que ja estao aqui (FLUX, clip_l, t5xxl, ae), entao
 # nao baixa nada grande: e so o programa e algumas bibliotecas de apoio.
+# O treinador quer versoes de transformers/diffusers diferentes das que o ComfyUI usa.
+# Em vez de trocar as do sistema (e arriscar quebrar a geracao de fotos), ele ganha um
+# ambiente proprio que REAPROVEITA o torch do sistema e so fixa as bibliotecas dele.
 RUN git clone -b sd3 --depth 1 https://github.com/kohya-ss/sd-scripts.git /sd-scripts \
- && pip install --no-cache-dir accelerate transformers safetensors sentencepiece \
-      ftfy toml voluptuous einops imagesize rich huggingface-hub \
-      diffusers==0.32.1 opencv-python-headless \
+ && python -m venv --system-site-packages /sd-venv \
+ && /sd-venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /sd-venv/bin/pip install --no-cache-dir \
+      accelerate==1.6.0 transformers==4.44.2 diffusers==0.32.1 \
+      safetensors==0.4.5 huggingface-hub==0.24.7 sentencepiece==0.2.0 \
+      ftfy==6.3.1 toml==0.10.2 voluptuous==0.15.2 einops==0.7.0 \
+      imagesize==1.4.1 rich==13.7.1 opencv-python-headless \
+ && test -f /sd-venv/bin/accelerate \
+ && /sd-venv/bin/python -c "import diffusers, transformers, cv2, torch; print('treinador ok', diffusers.__version__, transformers.__version__, torch.__version__)" \
  && python -c "import os;assert os.path.isfile('/sd-scripts/flux_train_network.py')"
 
 # 6) SDK do runpod + handler
