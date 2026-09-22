@@ -13,6 +13,8 @@ Entrada aceita:
   {"put": {"path": "tok/img/10_tok/001.jpg", "b64": "..."}}
                                            -> grava um arquivo na pasta de treino do volume
   {"limpa_treino": "tok"}                  -> apaga o conjunto de treino daquela personagem
+  {"poda": {"pasta":"tok_xl","manter":2}}  -> apaga os pontos antigos, guarda os N mais novos
+  {"espaco_treino": 1}                     -> quanto cada pasta de treino ocupa e o que sobra
   {"treino_estado": "tok"}                 -> quantas fotos e quantos passos ja treinados
   {"treina": {"token":"tok","passos":400,"total":1600,"base":"flux|sdxl","dim":16,"alpha":16}}
                                            -> treina UM pedaco e devolve o LoRA parcial
@@ -481,7 +483,73 @@ def estado_treino(token):
         if m:
             feitos = max(feitos, int(m.group(1)))
     return {"ok": True, "token": token, "fotos": fotos, "passos_feitos": feitos,
-            "partes": partes, "ultimo": (partes[-1] if partes else None)}
+            "partes": partes, "ultimo": (partes[-1] if partes else None),
+            "livre_gb": _livre_gb()}
+
+
+def _livre_gb():
+    try:
+        u = shutil.disk_usage(vol_base() or "/")
+        return round(u.free / 1073741824, 2)
+    except Exception:
+        return None
+
+
+def poda_pontos(pasta, manter=2):
+    """Apaga os pontos antigos do treino, guardando so os N mais novos.
+
+    Cada pedaco grava um .safetensors de ~170 MB. Sem poda, um treino de 3000
+    passos em pedacos de 400 deixa 8 arquivos (1,4 GB) e enche o volume — foi
+    exatamente o que aconteceu ("Disk quota exceeded" na hora de salvar).
+    """
+    raiz = treino_raiz()
+    pasta = _pasta(pasta)
+    if not raiz or not pasta:
+        return {"error": "pasta invalida"}
+    d = os.path.join(raiz, pasta, "saida")
+    if not os.path.isdir(d):
+        return {"ok": True, "apagados": [], "mb": 0, "livre_gb": _livre_gb()}
+    arquivos = sorted(f for f in os.listdir(d) if f.endswith(".safetensors"))
+    manter = max(1, int(manter or 2))
+    velhos = arquivos[:-manter] if len(arquivos) > manter else []
+    mb = 0.0
+    apagados = []
+    for f in velhos:
+        try:
+            cam = os.path.join(d, f)
+            mb += os.path.getsize(cam) / 1048576
+            os.remove(cam)
+            apagados.append(f)
+        except Exception:
+            pass
+    return {"ok": True, "apagados": apagados, "mb": round(mb, 1),
+            "guardados": arquivos[-manter:], "livre_gb": _livre_gb()}
+
+
+def espaco_treino():
+    """Quanto cada pasta de treino ocupa, e quanto sobra no volume."""
+    raiz = treino_raiz()
+    if not raiz:
+        return {"error": "este endpoint nao tem volume de rede: use o laboratorio"}
+    pastas = []
+    if os.path.isdir(raiz):
+        for nome in sorted(os.listdir(raiz)):
+            base = os.path.join(raiz, nome)
+            if not os.path.isdir(base):
+                continue
+            total = 0
+            pontos = 0
+            for r, _, fs in os.walk(base):
+                for f in fs:
+                    try:
+                        total += os.path.getsize(os.path.join(r, f))
+                    except Exception:
+                        pass
+                    if f.endswith(".safetensors"):
+                        pontos += 1
+            pastas.append({"pasta": nome, "mb": round(total / 1048576, 1), "pontos": pontos})
+    pastas.sort(key=lambda x: -x["mb"])
+    return {"ok": True, "pastas": pastas, "livre_gb": _livre_gb()}
 
 
 def treina_lora(spec):
@@ -534,6 +602,13 @@ def treina_lora(spec):
         faltam = [n for n, v in (("unet FLUX", unet), ("clip_l", clip_l), ("t5xxl", t5), ("vae ae", ae)) if not v]
         if faltam:
             return {"error": "faltam arquivos para treinar: " + ", ".join(faltam)}
+
+    # Poda antes de rodar: o save do proximo ponto precisa caber no volume.
+    # Guardamos 2 — o que vai continuar o treino e um de reserva.
+    try:
+        poda_pontos(pasta, int(spec.get("manter") or 2))
+    except Exception as e:
+        print("[worker] nao consegui podar pontos antigos:", e)
 
     anterior = est.get("ultimo")
     nome = "%s-%06d" % (token, feitos + passos)
@@ -619,6 +694,7 @@ def treina_lora(spec):
     return {"ok": True, "pronto": novo.get("passos_feitos", 0) >= total,
             "passos_feitos": novo.get("passos_feitos", 0), "total": total,
             "arquivo": nome + ".safetensors", "lora": copiado, "base": base_treino,
+            "livre_gb": _livre_gb(),
             "segundos": round(time.time() - t0, 1), "log": cauda[-600:]}
 
 
@@ -715,6 +791,15 @@ def handler(job):
 
     if inp.get("treino_estado"):
         return estado_treino(inp["treino_estado"])
+
+    if inp.get("poda"):
+        d = inp["poda"]
+        if isinstance(d, str):
+            d = {"pasta": d}
+        return poda_pontos(d.get("pasta"), d.get("manter") or 2)
+
+    if inp.get("espaco_treino"):
+        return espaco_treino()
 
     if inp.get("treina"):
         return treina_lora(inp["treina"])
