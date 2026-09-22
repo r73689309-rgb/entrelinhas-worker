@@ -526,11 +526,42 @@ def poda_pontos(pasta, manter=2):
             "guardados": arquivos[-manter:], "livre_gb": _livre_gb()}
 
 
+def _tamanho_dir(base):
+    total = 0
+    for r, _, fs in os.walk(base):
+        for f in fs:
+            try:
+                total += os.path.getsize(os.path.join(r, f))
+            except Exception:
+                pass
+    return total
+
+
 def espaco_treino():
-    """Quanto cada pasta de treino ocupa, e quanto sobra no volume."""
+    """Quanto cada pasta de treino ocupa, e o que mais ocupa o volume.
+
+    O disk_usage do Linux mostra o disco FISICO do servidor (centenas de TB),
+    nao a cota do volume — a cota nao e visivel daqui. Entao medimos o que
+    esta gravado: cada pasta de treino e cada pasta de modelo no volume.
+    """
     raiz = treino_raiz()
     if not raiz:
         return {"error": "este endpoint nao tem volume de rede: use o laboratorio"}
+    vb = vol_base()
+    volume = []   # pastas de primeiro nivel do volume, com tamanho
+    try:
+        for nome in sorted(os.listdir(vb)):
+            cam = os.path.join(vb, nome)
+            if os.path.isdir(cam):
+                volume.append({"pasta": nome, "mb": round(_tamanho_dir(cam) / 1048576, 1)})
+        if os.path.isdir(os.path.join(vb, "models_store")):
+            for nome in sorted(os.listdir(os.path.join(vb, "models_store"))):
+                cam = os.path.join(vb, "models_store", nome)
+                if os.path.isdir(cam):
+                    volume.append({"pasta": "models_store/" + nome, "mb": round(_tamanho_dir(cam) / 1048576, 1)})
+    except Exception as e:
+        print("[worker] nao consegui medir o volume:", e)
+    volume.sort(key=lambda x: -x["mb"])
     pastas = []
     if os.path.isdir(raiz):
         for nome in sorted(os.listdir(raiz)):
@@ -549,7 +580,9 @@ def espaco_treino():
                         pontos += 1
             pastas.append({"pasta": nome, "mb": round(total / 1048576, 1), "pontos": pontos})
     pastas.sort(key=lambda x: -x["mb"])
-    return {"ok": True, "pastas": pastas, "livre_gb": _livre_gb()}
+    total_mb = round(sum(x["mb"] for x in volume if "/" not in x["pasta"]), 1)
+    return {"ok": True, "pastas": pastas, "volume": volume, "total_mb": total_mb,
+            "raiz": raiz, "livre_gb": None}
 
 
 def treina_lora(spec):
