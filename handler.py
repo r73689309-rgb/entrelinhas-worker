@@ -475,7 +475,9 @@ def estado_treino(token):
     if os.path.isdir(imgs):
         fotos = len([f for f in os.listdir(imgs) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
     partes = []
+    quebrados = []
     if os.path.isdir(saida):
+        quebrados = apaga_pontos_quebrados(token)
         partes = sorted(f for f in os.listdir(saida) if f.endswith(".safetensors"))
     feitos = 0
     for p in partes:
@@ -484,7 +486,7 @@ def estado_treino(token):
             feitos = max(feitos, int(m.group(1)))
     return {"ok": True, "token": token, "fotos": fotos, "passos_feitos": feitos,
             "partes": partes, "ultimo": (partes[-1] if partes else None),
-            "livre_gb": _livre_gb()}
+            "quebrados": quebrados, "livre_gb": _livre_gb()}
 
 
 def _livre_gb():
@@ -493,6 +495,46 @@ def _livre_gb():
         return round(u.free / 1073741824, 2)
     except Exception:
         return None
+
+
+def _lora_ok(caminho):
+    """Um .safetensors comeca com 8 bytes (tamanho do cabecalho) + JSON.
+    Um arquivo cortado no meio (disco cheio) nao passa nem por isso."""
+    try:
+        tam = os.path.getsize(caminho)
+        with open(caminho, "rb") as f:
+            cab = f.read(8)
+            if len(cab) < 8:
+                return False
+            n = int.from_bytes(cab, "little")
+            if n <= 0 or n > 100_000_000 or 8 + n > tam:
+                return False
+            js = f.read(n)
+        json.loads(js.decode("utf-8"))
+        # o corpo dos tensores tem que existir alem do cabecalho
+        return tam > 8 + n + 1024
+    except Exception:
+        return False
+
+
+def apaga_pontos_quebrados(pasta):
+    """Remove pontos truncados: um deles seria carregado como 'ultimo' e derrubaria o treino."""
+    raiz = treino_raiz()
+    pasta = _pasta(pasta)
+    if not raiz or not pasta:
+        return []
+    d = os.path.join(raiz, pasta, "saida")
+    if not os.path.isdir(d):
+        return []
+    fora = []
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".safetensors") and not _lora_ok(os.path.join(d, f)):
+            try:
+                os.remove(os.path.join(d, f))
+                fora.append(f)
+            except Exception:
+                pass
+    return fora
 
 
 def poda_pontos(pasta, manter=2):
@@ -509,6 +551,7 @@ def poda_pontos(pasta, manter=2):
     d = os.path.join(raiz, pasta, "saida")
     if not os.path.isdir(d):
         return {"ok": True, "apagados": [], "mb": 0, "livre_gb": _livre_gb()}
+    quebrados = apaga_pontos_quebrados(pasta)
     arquivos = sorted(f for f in os.listdir(d) if f.endswith(".safetensors"))
     manter = max(1, int(manter or 2))
     velhos = arquivos[:-manter] if len(arquivos) > manter else []
@@ -522,7 +565,7 @@ def poda_pontos(pasta, manter=2):
             apagados.append(f)
         except Exception:
             pass
-    return {"ok": True, "apagados": apagados, "mb": round(mb, 1),
+    return {"ok": True, "apagados": apagados, "quebrados": quebrados, "mb": round(mb, 1),
             "guardados": arquivos[-manter:], "livre_gb": _livre_gb()}
 
 
