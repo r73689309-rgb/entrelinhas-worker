@@ -63,11 +63,12 @@ RUN mkdir -p unet diffusion_models text_encoders vae loras controlnet model_patc
 RUN git clone --depth 1 https://github.com/ostris/ai-toolkit.git $AITK \
  && python -m venv --system-site-packages /aitk-venv \
  && /aitk-venv/bin/pip install --no-cache-dir --upgrade pip \
- && grep -vhiE '^\s*(#|-r|torch|torchvision|torchaudio|torchcodec|av==|librosa|mutagen|gradio|fastapi|uvicorn)' \
+ && grep -vhiE '^\s*(#|-r|torch==|torch$|torchvision|torchaudio|torchcodec|av==|librosa|mutagen|gradio|fastapi|uvicorn)' \
       $AITK/requirements_base.txt $AITK/requirements.txt > /tmp/aitk.txt \
  && cat /tmp/aitk.txt \
  && ( /aitk-venv/bin/pip install --no-cache-dir -r /tmp/aitk.txt \
       || ( sed -i 's/^torchao==.*/torchao/' /tmp/aitk.txt && /aitk-venv/bin/pip install --no-cache-dir -r /tmp/aitk.txt ) ) \
+ && ( /aitk-venv/bin/python -c "import torchao" || /aitk-venv/bin/pip install --no-cache-dir torchao==0.10.0 || /aitk-venv/bin/pip install --no-cache-dir torchao ) \
  && /aitk-venv/bin/python -c "import torch, diffusers, transformers, peft, torchao; print('ai-toolkit ok', torch.__version__, diffusers.__version__, transformers.__version__)" \
  && test -f $AITK/run.py \
  && test -f $AITK/extensions_built_in/diffusion_models/z_image/z_image.py
