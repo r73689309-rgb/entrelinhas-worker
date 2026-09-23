@@ -179,21 +179,44 @@ def download_model(spec):
     if spec.get("token"):
         headers["Authorization"] = "Bearer " + spec["token"]
     req = urllib.request.Request(url, headers=headers)
-    tmp = dest + ".part"
+    # nome temporario UNICO: dois workers baixando o mesmo arquivo ao mesmo tempo
+    # nao podem escrever no mesmo .part (foi assim que um download corrompeu o outro)
+    tmp = dest + "." + uuid.uuid4().hex[:8] + ".part"
     t0 = time.time()
+    esperado = None
+    baixado = 0
     try:
         with urllib.request.urlopen(req, timeout=120) as r, open(tmp, "wb") as f:
+            try:
+                esperado = int(r.headers.get("Content-Length") or 0) or None
+            except Exception:
+                esperado = None
             while True:
                 chunk = r.read(1 << 20)
                 if not chunk:
                     break
                 f.write(chunk)
+                baixado += len(chunk)
     except Exception as e:
         try:
             os.remove(tmp)
         except Exception:
             pass
         return {"error": f"falha ao baixar: {e}"}
+    if esperado and baixado != esperado:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return {"error": "download incompleto: %d de %d bytes" % (baixado, esperado)}
+    if os.path.exists(dest) and not spec.get("overwrite"):
+        # outro worker terminou antes: fica com o dele, joga o nosso fora
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return {"ok": True, "path": dest, "mb": round(os.path.getsize(dest) / 1048576, 1),
+                "note": "outro worker baixou antes"}
     os.replace(tmp, dest)
     mb = round(os.path.getsize(dest) / 1048576, 1)
     persistente = bool(volume_root()) and dest.startswith("/runpod-volume")
@@ -269,27 +292,65 @@ def _tem(sub, name):
     return None
 
 
-def preparar(grupos, token=None):
-    """Garante no volume os arquivos dos grupos pedidos. Idempotente."""
+def _tamanho_remoto(url, token=None):
+    """Content-Length do arquivo no servidor (seguindo redirecionamentos)."""
+    try:
+        headers = {"User-Agent": "entrelinhas-worker"}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        req = urllib.request.Request(url, headers=headers, method="HEAD")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return int(r.headers.get("Content-Length") or 0) or None
+    except Exception:
+        return None
+
+
+def preparar(grupos, token=None, verificar=True):
+    """Garante no volume os arquivos dos grupos pedidos. Idempotente.
+    Com verificar=True confere o tamanho de cada arquivo com o servidor e
+    baixa de novo o que estiver truncado/corrompido."""
     if not volume_root():
         return {"error": "este endpoint nao tem network volume: a v2 precisa de um"}
     if isinstance(grupos, str):
         grupos = [grupos]
     grupos = [g for g in (grupos or []) if g in MANIFESTO] or ["zimage"]
-    feito, baixado, erros = [], [], []
+    feito, baixado, erros, refeitos = [], [], [], []
     t0 = time.time()
     for g in grupos:
         for sub, name, url in MANIFESTO[g]:
-            if _tem(sub, name):
-                feito.append(sub + "/" + name)
-                continue
+            local = _tem(sub, name)
+            if local:
+                if verificar:
+                    esperado = _tamanho_remoto(url, token)
+                    real = os.path.getsize(local)
+                    if esperado and real != esperado:
+                        refeitos.append({"arquivo": sub + "/" + name, "local": real, "esperado": esperado})
+                        try:
+                            os.remove(local)
+                        except Exception as e:
+                            erros.append({"arquivo": sub + "/" + name, "erro": "nao consegui apagar o corrompido: %s" % e})
+                            continue
+                    else:
+                        feito.append(sub + "/" + name)
+                        continue
+                else:
+                    feito.append(sub + "/" + name)
+                    continue
+            # limpa restos de .part antigos desse arquivo
+            try:
+                d = os.path.join(volume_root(), sub)
+                for f in os.listdir(d) if os.path.isdir(d) else []:
+                    if f.startswith(name + ".") and f.endswith(".part"):
+                        os.remove(os.path.join(d, f))
+            except Exception:
+                pass
             r = download_model({"url": url, "dir": sub, "name": name, "token": token})
             if r.get("error"):
                 erros.append({"arquivo": sub + "/" + name, "erro": r["error"]})
             else:
                 baixado.append({"arquivo": sub + "/" + name, "mb": r.get("mb")})
     return {"ok": not erros, "ja_tinha": feito, "baixado": baixado, "erros": erros,
-            "livre_gb": _livre_gb(), "segundos": round(time.time() - t0, 1)}
+            "refeitos": refeitos, "livre_gb": _livre_gb(), "segundos": round(time.time() - t0, 1)}
 
 
 def falta(grupo):
@@ -948,15 +1009,29 @@ def publica_lora(spec):
 
 
 # ---------------------------------------------------------------- handler
+def _log(res):
+    """Escreve o resultado no log do worker (sem imagens): da para ler no console."""
+    try:
+        if isinstance(res, dict) and "images" not in res:
+            print("[worker] resultado:", json.dumps(res, ensure_ascii=False)[:3000])
+    except Exception:
+        pass
+    return res
+
+
 def handler(job):
     inp = job.get("input") or {}
+    try:
+        print("[worker] pedido:", json.dumps({k: (v if k not in ("workflow", "prompt", "images", "put") else "...") for k, v in inp.items()}, ensure_ascii=False)[:500])
+    except Exception:
+        pass
 
     # estas nao precisam do ComfyUI no ar
     if inp.get("ls") is not None:
-        return list_models(inp.get("ls"))
+        return _log(list_models(inp.get("ls")))
 
     if inp.get("download"):
-        return download_model(inp["download"])
+        return _log(download_model(inp["download"]))
 
     if inp.get("delete"):
         return delete_model(inp["delete"])
@@ -968,7 +1043,7 @@ def handler(job):
         return limpa_treino(inp["limpa_treino"])
 
     if inp.get("treino_estado"):
-        return estado_treino(inp["treino_estado"])
+        return _log(estado_treino(inp["treino_estado"]))
 
     if inp.get("poda"):
         d = inp["poda"]
@@ -977,19 +1052,19 @@ def handler(job):
         return poda_pontos(d.get("pasta"), d.get("manter") or 2)
 
     if inp.get("espaco_treino"):
-        return espaco_treino()
+        return _log(espaco_treino())
 
     if inp.get("preparar") is not None:
         d = inp["preparar"]
         if isinstance(d, dict):
-            return preparar(d.get("grupos"), d.get("token"))
-        return preparar(d)
+            return _log(preparar(d.get("grupos"), d.get("token"), d.get("verificar", True)))
+        return _log(preparar(d))
 
     if inp.get("treina"):
-        return treina_lora(inp["treina"])
+        return _log(treina_lora(inp["treina"]))
 
     if inp.get("publicar"):
-        return publica_lora(inp["publicar"])
+        return _log(publica_lora(inp["publicar"]))
 
     start_comfy()
 
@@ -1035,8 +1110,8 @@ def handler(job):
     try:
         res = api_post("/prompt", {"prompt": wf, "client_id": client_id})
     except urllib.error.HTTPError as e:
-        return {"error": "workflow rejeitado pelo ComfyUI",
-                "detail": e.read().decode()[:4000]}
+        return _log({"error": "workflow rejeitado pelo ComfyUI",
+                     "detail": e.read().decode()[:4000]})
     pid = res.get("prompt_id")
     if not pid:
         return {"error": "ComfyUI nao devolveu prompt_id", "detail": res}
@@ -1062,9 +1137,9 @@ def handler(job):
                     pass
             return {"images": imgs, "seconds": round(time.time() - t0, 1)}
         if status.get("status_str") == "error":
-            return {"error": "erro na execucao", "detail": status.get("messages")}
+            return _log({"error": "erro na execucao", "detail": status.get("messages")})
 
-    return {"error": "tempo limite excedido"}
+    return _log({"error": "tempo limite excedido"})
 
 
 if __name__ == "__main__":
