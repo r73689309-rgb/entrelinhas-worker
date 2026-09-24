@@ -60,6 +60,8 @@ RUN mkdir -p unet diffusion_models text_encoders vae loras controlnet model_patc
 # 6) Treinador: ai-toolkit (ostris) — e o treinador padrao para Z-Image em 2026.
 #    Ambiente proprio que REAPROVEITA o torch do sistema. As bibliotecas de video/audio
 #    e a interface web ficam de fora: so treinamos LoRA de imagem.
+#    mediapipe fixo em 0.10.21: as versoes novas tiraram mp.solutions, que o
+#    controlnet_aux importa quando o ai-toolkit carrega as extensoes.
 RUN git clone --depth 1 https://github.com/ostris/ai-toolkit.git $AITK \
  && python -m venv --system-site-packages /aitk-venv \
  && /aitk-venv/bin/pip install --no-cache-dir --upgrade pip \
@@ -69,7 +71,9 @@ RUN git clone --depth 1 https://github.com/ostris/ai-toolkit.git $AITK \
  && ( /aitk-venv/bin/pip install --no-cache-dir -r /tmp/aitk.txt \
       || ( sed -i 's/^torchao==.*/torchao/' /tmp/aitk.txt && /aitk-venv/bin/pip install --no-cache-dir -r /tmp/aitk.txt ) ) \
  && ( /aitk-venv/bin/python -c "import torchao" || /aitk-venv/bin/pip install --no-cache-dir torchao==0.10.0 || /aitk-venv/bin/pip install --no-cache-dir torchao ) \
+ && /aitk-venv/bin/pip install --no-cache-dir "mediapipe==0.10.21" \
  && /aitk-venv/bin/python -c "import torch, diffusers, transformers, peft, torchao; print('ai-toolkit ok', torch.__version__, diffusers.__version__, transformers.__version__)" \
+ && cd $AITK && /aitk-venv/bin/python -c "import mediapipe as mp; mp.solutions.drawing_utils; from toolkit.extension import get_all_extensions_process_dict as g; print('extensoes ok', len(g()))" \
  && test -f $AITK/run.py \
  && test -f $AITK/extensions_built_in/diffusion_models/z_image/z_image.py
 
