@@ -104,6 +104,10 @@ def link_models():
     linhas = ["volume:", "  base_path: %s" % vol, "  is_default: false"]
     for name in MODEL_DIRS:
         linhas.append("  %s: %s" % (name, name))
+    # o Impact Subpack lista os detectores por "ultralytics_bbox"/"ultralytics_segm",
+    # e nao por "ultralytics": sem isso o detector de maos do volume nao aparece
+    linhas.append("  ultralytics_bbox: ultralytics/bbox")
+    linhas.append("  ultralytics_segm: ultralytics/segm")
     try:
         with open(cfg, "w") as f:
             f.write("\n".join(linhas) + "\n")
