@@ -58,22 +58,25 @@ RUN mkdir -p unet diffusion_models text_encoders vae loras controlnet model_patc
  && rm -rf $COMFY/models/clip && ln -s text_encoders $COMFY/models/clip
 
 # 6) Treinador: ai-toolkit (ostris) — e o treinador padrao para Z-Image em 2026.
-#    Ambiente proprio que REAPROVEITA o torch do sistema. As bibliotecas de video/audio
-#    e a interface web ficam de fora: so treinamos LoRA de imagem.
+#    Ambiente proprio que REAPROVEITA o torch do sistema.
+#    A interface web fica de fora. av/librosa/mutagen ENTRAM: o toolkit passou a
+#    importa-los no carregamento, mesmo para treino de imagem.
 #    mediapipe fixo em 0.10.21: as versoes novas tiraram mp.solutions, que o
 #    controlnet_aux importa quando o ai-toolkit carrega as extensoes.
+#    A checagem final carrega todas as extensoes como o run.py faz (fingindo a
+#    GPU, que o build nao tem): se algo faltar, o erro aparece aqui e nao no treino.
 RUN git clone --depth 1 https://github.com/ostris/ai-toolkit.git $AITK \
  && python -m venv --system-site-packages /aitk-venv \
  && /aitk-venv/bin/pip install --no-cache-dir --upgrade pip \
- && grep -vhiE '^\s*(#|-r|torch==|torch$|torchvision|torchaudio|torchcodec|av==|librosa|mutagen|gradio|fastapi|uvicorn)' \
+ && grep -vhiE '^\s*(#|-r|torch==|torch$|torchvision|torchaudio|torchcodec|gradio|fastapi|uvicorn)' \
       $AITK/requirements_base.txt $AITK/requirements.txt > /tmp/aitk.txt \
+ && printf 'mediapipe==0.10.21\nnumpy<2\n' >> /tmp/aitk.txt \
  && cat /tmp/aitk.txt \
  && ( /aitk-venv/bin/pip install --no-cache-dir -r /tmp/aitk.txt \
       || ( sed -i 's/^torchao==.*/torchao/' /tmp/aitk.txt && /aitk-venv/bin/pip install --no-cache-dir -r /tmp/aitk.txt ) ) \
  && ( /aitk-venv/bin/python -c "import torchao" || /aitk-venv/bin/pip install --no-cache-dir torchao==0.10.0 || /aitk-venv/bin/pip install --no-cache-dir torchao ) \
- && /aitk-venv/bin/pip install --no-cache-dir "mediapipe==0.10.21" \
  && /aitk-venv/bin/python -c "import torch, diffusers, transformers, peft, torchao; print('ai-toolkit ok', torch.__version__, diffusers.__version__, transformers.__version__)" \
- && cd $AITK && /aitk-venv/bin/python -c "import mediapipe as mp; mp.solutions.drawing_utils; from toolkit.extension import get_all_extensions_process_dict as g; print('extensoes ok', len(g()))" \
+ && cd $AITK && PYTHONPATH=$AITK /aitk-venv/bin/python -c "import torch; torch.cuda.current_device=lambda:0; torch.cuda.get_device_properties=lambda i=0: type('P',(),{'warp_size':32,'major':8,'minor':6,'name':'x','total_memory':24<<30,'multi_processor_count':80})(); import cv2, mediapipe as mp; mp.solutions.drawing_utils; from toolkit.extension import get_all_extensions_process_dict as g; print('extensoes ok', len(g()))" \
  && test -f $AITK/run.py \
  && test -f $AITK/extensions_built_in/diffusion_models/z_image/z_image.py
 
