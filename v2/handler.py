@@ -806,6 +806,18 @@ def espaco_treino():
             "raiz": raiz, "livre_gb": None}
 
 
+def _libera_vram_comfy():
+    try:
+        req = urllib.request.Request("http://%s/free" % HOST, method="POST",
+                                     data=json.dumps({"unload_models": True, "free_memory": True}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=30).read()
+        time.sleep(3)
+        print("[worker] VRAM do ComfyUI liberada antes do treino")
+    except Exception as e:
+        print("[worker] nao consegui liberar a VRAM do ComfyUI:", e)
+
+
 def treina_lora(spec):
     """Roda UM pedaco do treino no ai-toolkit (Z-Image Base). O app chama de novo
     ate chegar no total; o ai-toolkit retoma sozinho do ultimo ponto salvo."""
@@ -836,6 +848,9 @@ def treina_lora(spec):
     if len(fotos) < 5:
         return {"error": "poucas fotos na pasta (%d): mande o conjunto antes de treinar" % len(fotos)}
 
+    # o mesmo worker pode ter gerado fotos antes: o ComfyUI ainda segura ~18 GB
+    # de VRAM com o Z-Image carregado, e o treino morre sem memoria. Libera antes.
+    _libera_vram_comfy()
     faltando = falta("zimage")
     if faltando:
         r = preparar(["zimage"], spec.get("hf"))
