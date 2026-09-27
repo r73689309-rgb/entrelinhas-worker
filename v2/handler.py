@@ -638,7 +638,8 @@ def estado_treino(token):
     partes.sort(key=lambda f: (int((re.search(r"_(\d{6,9})\.safetensors$", f) or [0, "0"])[1]) if re.search(r"_(\d{6,9})\.safetensors$", f) else 10**9))
     return {"ok": True, "token": token, "fotos": fotos, "passos_feitos": feitos,
             "partes": partes, "ultimo": (partes[-1] if partes else None),
-            "quebrados": quebrados, "livre_gb": _livre_gb()}
+            "quebrados": quebrados, "livre_gb": _livre_gb(),
+            "status": le_status(token)}
 
 
 def _passo_meta(caminho):
@@ -818,7 +819,7 @@ def _libera_vram_comfy():
         print("[worker] nao consegui liberar a VRAM do ComfyUI:", e)
 
 
-def treina_lora(spec):
+def treina_lora(spec, job=None):
     """Roda UM pedaco do treino no ai-toolkit (Z-Image Base). O app chama de novo
     ate chegar no total; o ai-toolkit retoma sozinho do ultimo ponto salvo."""
     raiz = treino_raiz()
@@ -860,11 +861,16 @@ def treina_lora(spec):
 
     est = estado_treino(pasta)
     feitos = est.get("passos_feitos", 0)
+    tudo = bool(spec.get("tudo"))
     passos = max(50, min(1500, int(spec.get("passos") or 500)))
     total = max(passos, min(6000, int(spec.get("total") or 2000)))
+    if tudo:
+        total = max(100, min(6000, int(spec.get("total") or 2000)))
     if feitos >= total:
         return {"ok": True, "pronto": True, "passos_feitos": feitos, "arquivo": est.get("ultimo")}
-    alvo = min(total, feitos + passos)
+    alvo = total if tudo else min(total, feitos + passos)
+    if tudo:
+        passos = total - feitos
 
     try:
         poda_pontos(pasta, int(spec.get("manter") or 2))
@@ -874,7 +880,7 @@ def treina_lora(spec):
     dim = max(4, min(64, int(spec.get("dim") or 16)))
     alpha = max(1, min(dim, int(spec.get("alpha") or dim)))
     lr = str(spec.get("lr") or "1e-4")
-    salvar_cada = max(50, min(passos, int(spec.get("salvar_cada") or 250)))
+    salvar_cada = max(50, min(max(passos, 50), int(spec.get("salvar_cada") or 250)))
     nome = pasta  # o ai-toolkit retoma pelo nome do job: precisa ser estavel
     hf_home = os.path.join(vol_base(), "hf")
     os.makedirs(hf_home, exist_ok=True)
@@ -926,12 +932,22 @@ def treina_lora(spec):
         env["HF_TOKEN"] = spec["hf"]
     cmd = [AITK_PY, os.path.join(AITK, "run.py"), cfg_path]
     t0 = time.time()
-    try:
-        p = subprocess.run(cmd, cwd=AITK, capture_output=True, text=True, env=env,
-                           timeout=max(120, int(spec.get("limite") or 1700)))
-    except subprocess.TimeoutExpired:
-        return {"error": "o pedaco passou do tempo do job: diminua os passos por pedaco"}
-    cauda = ((p.stdout or "")[-1500:] + "\n" + (p.stderr or "")[-2500:]).strip()
+    if tudo:
+        env["PYTHONUNBUFFERED"] = "1"
+        rc, cauda = _roda_com_progresso(cmd, env, pasta, feitos, total, job,
+                                        max(600, int(spec.get("limite") or 13500)))
+        if spec.get("hf"):
+            cauda = cauda.replace(spec["hf"], "<token>")
+        if rc is None:
+            return {"error": "o treino passou do tempo maximo do job", "detail": cauda}
+        p = type("R", (), {"returncode": rc})()
+    else:
+        try:
+            p = subprocess.run(cmd, cwd=AITK, capture_output=True, text=True, env=env,
+                               timeout=max(120, int(spec.get("limite") or 1700)))
+        except subprocess.TimeoutExpired:
+            return {"error": "o pedaco passou do tempo do job: diminua os passos por pedaco"}
+        cauda = ((p.stdout or "")[-1500:] + "\n" + (p.stderr or "")[-2500:]).strip()
     if spec.get("hf"):
         cauda = cauda.replace(spec["hf"], "<token>")
     novo = estado_treino(pasta)
@@ -954,6 +970,139 @@ def treina_lora(spec):
             "arquivo": novo.get("ultimo"), "lora": copiado, "base": base_treino,
             "livre_gb": _livre_gb(),
             "segundos": round(time.time() - t0, 1), "log": cauda[-600:]}
+
+
+# ---------------------------------------------------------------- treino inteiro
+# O app manda UM job e pode fechar. O worker treina tudo, vai gravando o andamento
+# em status.json (no volume) e no /status da RunPod, e publica no HF no fim.
+def _status_path(pasta):
+    raiz = treino_raiz()
+    return os.path.join(raiz, pasta, "status.json") if raiz and pasta else None
+
+
+def grava_status(pasta, **campos):
+    cam = _status_path(pasta)
+    if not cam:
+        return
+    try:
+        atual = le_status(pasta) or {}
+        atual.update(campos)
+        atual["atualizado"] = int(time.time())
+        tmp = cam + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(atual, f)
+        os.replace(tmp, cam)
+    except Exception as e:
+        print("[worker] nao consegui gravar status:", e)
+
+
+def le_status(pasta):
+    cam = _status_path(pasta)
+    try:
+        with open(cam) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _avisa(job, dados):
+    if not job:
+        return
+    try:
+        runpod.serverless.progress_update(job, dados)
+    except Exception as e:
+        print("[worker] progress_update falhou:", e)
+
+
+PASSO_RE = re.compile(r"(\d+)/(\d+)\s*\[")
+
+
+def _roda_com_progresso(cmd, env, pasta, feitos, total, job, limite):
+    """Roda o ai-toolkit lendo a barra de progresso. Devolve (codigo, cauda);
+    codigo None = passou do tempo."""
+    import collections
+    import threading
+    cauda = collections.deque(maxlen=60)
+    estado = {"passo": feitos}
+
+    p = subprocess.Popen(cmd, cwd=AITK, env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, bufsize=0)
+
+    def le():
+        buf = b""
+        while True:
+            ch = p.stdout.read(4096)
+            if not ch:
+                break
+            buf += ch
+            partes = re.split(rb"[\r\n]", buf)
+            buf = partes.pop()
+            for linha in partes:
+                t = linha.decode("utf-8", "ignore").strip()
+                if not t:
+                    continue
+                cauda.append(t[-400:])
+                # so a barra do treino tem "lr:" ou "loss"; as de cache nao
+                if "loss" in t or "lr:" in t:
+                    m = PASSO_RE.search(t)
+                    if m:
+                        estado["passo"] = max(estado["passo"], int(m.group(1)))
+
+    th = threading.Thread(target=le, daemon=True)
+    th.start()
+    t0 = time.time()
+    ultimo = -1
+    while p.poll() is None:
+        time.sleep(15)
+        passo = estado["passo"]
+        if passo != ultimo:
+            ultimo = passo
+            grava_status(pasta, estado="treinando", passos=passo, total=total)
+            _avisa(job, {"estado": "treinando", "passos": passo, "total": total,
+                         "minutos": round((time.time() - t0) / 60, 1)})
+        if time.time() - t0 > limite:
+            p.kill()
+            th.join(5)
+            return None, "\n".join(cauda)
+    th.join(10)
+    return p.returncode, "\n".join(cauda)
+
+
+def treino_completo(spec, job=None):
+    token = (spec.get("token") or "").strip().lower()
+    pasta = _pasta(spec, "zimage")
+    if not pasta or not TOKEN_RE.match(token):
+        return {"error": "palavra-chave invalida"}
+    total = int(spec.get("total") or 2000)
+    grava_status(pasta, estado="comecando", passos=0, total=total, url=None, erro=None,
+                 inicio=int(time.time()), job=(job or {}).get("id"))
+    _avisa(job, {"estado": "comecando", "passos": 0, "total": total})
+    s = dict(spec)
+    s["tudo"] = True
+    r = treina_lora(s, job)
+    if r.get("error"):
+        grava_status(pasta, estado="falhou", erro=r["error"], detalhe=str(r.get("detail") or "")[-1500:])
+        return r
+    grava_status(pasta, estado="publicando", passos=r.get("passos_feitos"), total=total)
+    _avisa(job, {"estado": "publicando", "passos": r.get("passos_feitos"), "total": total})
+    r["publicado"] = None
+    if not r.get("lora"):
+        # ja estava treinado (job repetido): publica a copia que ficou em loras/
+        cand = token + "-zi.safetensors"
+        if os.path.isfile(os.path.join(models_root() or "", "loras", cand)):
+            r["lora"] = cand
+    hf = (spec.get("hf") or "").strip()
+    repo = (spec.get("repo") or "").strip()
+    if hf and repo and r.get("lora"):
+        pub = publica_lora({"token": hf, "repo": repo, "nome": r["lora"], "pasta": pasta})
+        if pub.get("error"):
+            r["erro_publicar"] = pub["error"] + (" " + str(pub.get("detail") or "")[-300:] if pub.get("detail") else "")
+        else:
+            r["publicado"] = pub.get("url")
+    grava_status(pasta, estado="pronto", passos=r.get("passos_feitos"), total=total,
+                 lora=r.get("lora"), url=r.get("publicado"), erro=r.get("erro_publicar"),
+                 fim=int(time.time()))
+    return r
 
 
 def publica_lora(spec):
@@ -1041,7 +1190,9 @@ def _log(res):
 def handler(job):
     inp = job.get("input") or {}
     try:
-        print("[worker] pedido:", json.dumps({k: (v if k not in ("workflow", "prompt", "images", "put") else "...") for k, v in inp.items()}, ensure_ascii=False)[:500])
+        print("[worker] pedido:", json.dumps({k: (v if k not in ("workflow", "prompt", "images", "put") else "...") for k, v in inp.items()}, ensure_ascii=False)[:500]
+              .replace(str((inp.get("treino_completo") or inp.get("treina") or {}).get("hf") or "\x00"), "<token>")
+              .replace(str((inp.get("publicar") or {}).get("token") or "\x00"), "<token>"))
     except Exception:
         pass
 
@@ -1081,6 +1232,9 @@ def handler(job):
 
     if inp.get("treina"):
         return _log(treina_lora(inp["treina"]))
+
+    if inp.get("treino_completo"):
+        return _log(treino_completo(inp["treino_completo"], job))
 
     if inp.get("publicar"):
         return _log(publica_lora(inp["publicar"]))
