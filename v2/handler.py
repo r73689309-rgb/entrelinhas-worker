@@ -20,6 +20,8 @@ Entrada aceita:
                                            -> baixa para o volume os modelos que faltam (v2)
   {"treina": {"token":"tok","passos":400,"total":1600,"base":"zimage","dim":16,"alpha":16}}
                                            -> treina UM pedaco (ai-toolkit, Z-Image Base)
+  {"inspeciona": {}}                      -> v3: familia de cada modelo/LoRA (le o cabecalho) e arruma a pasta
+  {"treino_completo": {"token":"tok","base":"sdxl|sd15|zimage|flux|chroma|qwen|livre","modelo":"arquivo ou repo"}}
   {"publicar": {"token":"<hf>","repo":"user/loras","nome":"tok.safetensors","pasta":"tok_xl"}}
                                            -> sobe o LoRA para um repo privado do HF
 Saida:
@@ -281,11 +283,169 @@ MANIFESTO = {
         ("loras", "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
          HF + "/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"),
     ],
+    # v3: arquivos de apoio das familias abertas (o modelo em si o usuario baixa)
+    "flux_suporte": [  # FLUX dev/Krea/schnell e derivados em formato "so o modelo"
+        ("text_encoders", "clip_l.safetensors", HF + "/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors"),
+        ("text_encoders", "t5xxl_fp8_e4m3fn_scaled.safetensors", HF + "/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors"),
+        ("vae", "ae.safetensors", HF + "/Comfy-Org/z_image/resolve/main/split_files/vae/ae.safetensors"),
+    ],
+    "chroma_suporte": [
+        ("text_encoders", "t5xxl_fp8_e4m3fn_scaled.safetensors", HF + "/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn_scaled.safetensors"),
+        ("vae", "ae.safetensors", HF + "/Comfy-Org/z_image/resolve/main/split_files/vae/ae.safetensors"),
+    ],
+    "qwen_suporte": [
+        ("text_encoders", "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+         HF + "/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors"),
+        ("vae", "qwen_image_vae.safetensors",
+         HF + "/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors"),
+    ],
     "sdxl": [  # so para comparar com o que tinhamos (RealVisXL 5)
         ("checkpoints", "realvisxl5.safetensors",
          HF + "/SG161222/RealVisXL_V5.0/resolve/main/RealVisXL_V5.0_fp16.safetensors"),
     ],
 }
+
+
+# ---------------------------------------------------------------- v3: reconhecer a familia de cada arquivo
+# O app nao precisa mais adivinhar pelo nome: o worker le o cabecalho do .safetensors
+# (so os nomes das camadas, sem carregar o modelo) e diz de que familia ele e.
+def _cabecalho(p):
+    with open(p, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        if n <= 0 or n > 300_000_000:
+            return None
+        return json.loads(f.read(n))
+
+
+def _fam_modelo(h, nome):
+    K = [k for k in h.keys() if k != "__metadata__"]
+    if any(k.startswith("conditioner.embedders.1") for k in K):
+        return "sdxl", "ckpt"
+    if any(k.startswith("cond_stage_model.model.") for k in K):
+        return "sd2", "ckpt"
+    if any(k.startswith("cond_stage_model.") for k in K) and any("input_blocks" in k for k in K):
+        return "sd15", "ckpt"
+    pref = "model.diffusion_model."
+    D = [k[len(pref):] for k in K if k.startswith(pref)] or K
+    completo = any(k.startswith(("text_encoders.", "vae.", "first_stage_model.")) for k in K)
+    def d(*subs):
+        return any(all(x in k for x in subs) for k in D)
+    fam = "?"
+    if d("distilled_guidance_layer"):
+        fam = "chroma"
+    elif d("double_blocks.0.img_attn"):
+        fam = "flux"
+    elif d("cap_embedder") and (d("noise_refiner") or d("context_refiner")):
+        fam = "lumina2"
+        for k in K:
+            if k.endswith("x_embedder.weight") and (h[k].get("shape") or [0])[0] == 3840:
+                fam = "zimage"
+                break
+    elif d("transformer_blocks.0.img_mod"):
+        fam = "qwen"
+    elif d("joint_blocks"):
+        fam = "sd3"
+    elif d("double_stream_blocks"):
+        fam = "hidream"
+    elif d("patch_embedding") and d("cross_attn"):
+        fam = "wan"
+    elif d("input_blocks") and d("label_emb"):
+        fam = "sdxl"
+    return fam, ("ckpt" if completo else "unet")
+
+
+def _fam_lora(h, nome):
+    n = nome.lower()
+    for suf, fam in (("-zi", "zimage"), ("-xl", "sdxl"), ("-15", "sd15"), ("-fx", "flux"), ("-ch", "chroma"), ("-qi", "qwen"), ("-lv", "livre")):
+        if re.search(re.escape(suf) + r"(-v[0-9a-f]+)?(_\d+)?\.safetensors$", n):
+            return fam
+    meta = json.dumps(h.get("__metadata__") or {}).lower()
+    for pal, fam in (("zimage", "zimage"), ("qwen_image", "qwen"), ("chroma", "chroma"), ("flux", "flux"), ("sdxl", "sdxl")):
+        if '"arch": "%s' % pal in meta or "\\\"arch\\\": \\\"%s" % pal in meta:
+            return fam
+    K = [k for k in h.keys() if k != "__metadata__"]
+    def tem(*subs):
+        return any(all(x in k for x in subs) for k in K)
+    if tem("double_blocks") or tem("single_blocks") or tem("single_transformer_blocks"):
+        return "flux"
+    if tem("img_mlp") or tem("txt_mlp") or tem("img_mod"):
+        return "qwen"
+    if tem("layers.", "attention") or tem("layers.", "feed_forward") or tem("layers_", "attention"):
+        return "zimage"
+    if tem("te2") or tem("text_encoder_2") or tem("transformer_blocks_1") or tem("transformer_blocks.1."):
+        return "sdxl"
+    if tem("lora_unet") or tem("down_blocks") or tem("input_blocks"):
+        return "sd15"
+    return "?"
+
+
+PASTA_CERTA = {"sdxl": "checkpoints", "sd15": "checkpoints", "sd2": "checkpoints"}
+
+
+def inspeciona(spec=None):
+    spec = spec or {}
+    vol = volume_root()
+    cache_p = os.path.join(vol_base() or "/tmp", "inspecao.json")
+    try:
+        cache = json.load(open(cache_p))
+    except Exception:
+        cache = {}
+    modelos, loras, movidos = [], [], []
+    vistos = set()
+    for raiz in [r for r in (IMG_ROOT, vol) if r and os.path.isdir(r)]:
+        for pasta in ("checkpoints", "unet", "diffusion_models", "loras"):
+            dd = os.path.join(raiz, pasta)
+            if not os.path.isdir(dd):
+                continue
+            for f in sorted(os.listdir(dd)):
+                p = os.path.join(dd, f)
+                if not os.path.isfile(p) or not f.lower().endswith((".safetensors", ".gguf", ".ckpt", ".sft")):
+                    continue
+                if p in vistos:
+                    continue
+                st = os.stat(p)
+                chave = "%s|%d|%d" % (p, st.st_size, int(st.st_mtime))
+                info = cache.get(chave)
+                if not info:
+                    fam, formato = "?", "?"
+                    try:
+                        if f.lower().endswith((".safetensors", ".sft")):
+                            h = _cabecalho(p) or {}
+                            if pasta == "loras":
+                                fam, formato = _fam_lora(h, f), "lora"
+                            else:
+                                fam, formato = _fam_modelo(h, f)
+                        elif f.lower().endswith(".gguf"):
+                            n = f.lower()
+                            fam = next((fm for pal, fm in (("qwen", "qwen"), ("chroma", "chroma"), ("flux", "flux"), ("z_image", "zimage"), ("zimage", "zimage"), ("wan", "wan")) if pal in n), "?")
+                            formato = "gguf"
+                    except Exception as e:
+                        fam, formato = "?", "erro: %s" % e
+                    info = {"fam": fam, "formato": formato}
+                    cache[chave] = info
+                item = {"nome": f, "pasta": pasta, "fam": info["fam"], "formato": info["formato"],
+                        "mb": round(st.st_size / 1048576, 1), "volume": raiz == vol}
+                # arquivo na pasta errada (ex.: checkpoint SDXL baixado em unet): move dentro do volume
+                certa = PASTA_CERTA.get(info["fam"]) if pasta != "loras" else None
+                if pasta != "loras" and info["formato"] == "unet" and pasta == "checkpoints":
+                    certa = "diffusion_models"
+                if certa and certa != pasta and raiz == vol and spec.get("mover", True):
+                    destino = os.path.join(vol, certa, f)
+                    if not os.path.exists(destino):
+                        try:
+                            os.makedirs(os.path.dirname(destino), exist_ok=True)
+                            os.replace(p, destino)
+                            vistos.add(destino)
+                            movidos.append({"nome": f, "de": pasta, "para": certa})
+                            item["pasta"] = certa
+                        except Exception as e:
+                            item["erro_mover"] = str(e)
+                (loras if pasta == "loras" else modelos).append(item)
+    try:
+        json.dump(cache, open(cache_p, "w"))
+    except Exception:
+        pass
+    return {"ok": True, "modelos": modelos, "loras": loras, "movidos": movidos, "livre_gb": _livre_gb()}
 
 
 def _tem(sub, name):
@@ -509,9 +669,11 @@ AITK = os.environ.get("AITK", "/ai-toolkit")
 AITK_PY = "/aitk-venv/bin/python" if os.path.isfile("/aitk-venv/bin/python") else sys.executable
 SAFE_REL = re.compile(r"^[A-Za-z0-9._\-/]+$")
 TOKEN_RE = re.compile(r"^[a-z0-9]{2,32}$")
+# v3: cada familia treinavel tem um sufixo (pasta de treino e nome do arquivo da LoRA)
+SUFIXO = {"zimage": "zi", "sdxl": "xl", "sd15": "15", "flux": "fx", "chroma": "ch", "qwen": "qi", "livre": "lv"}
 # A pasta no volume pode diferir da palavra-chave: a mesma personagem pode ter
 # um treino de FLUX e um de SDXL, e misturar os dois quebra a continuacao.
-PASTA_RE = re.compile(r"^[a-z0-9]{2,32}(_xl|_zi)?$")
+PASTA_RE = re.compile(r"^[a-z0-9]{2,32}(_xl|_zi|_15|_fx|_ch|_qi|_lv)?$")
 
 
 def _pasta(spec_ou_token, base=None):
@@ -519,10 +681,9 @@ def _pasta(spec_ou_token, base=None):
         p = (spec_ou_token.get("pasta") or spec_ou_token.get("token") or "").strip().lower()
     else:
         p = (spec_ou_token or "").strip().lower()
-    if base == "sdxl" and not p.endswith("_xl"):
-        p += "_xl"
-    if base == "zimage" and not p.endswith("_zi"):
-        p += "_zi"
+    suf = SUFIXO.get(base or "")
+    if suf and not p.endswith("_" + suf):
+        p += "_" + suf
     return p if PASTA_RE.match(p) else ""
 
 
@@ -819,6 +980,84 @@ def _libera_vram_comfy():
         print("[worker] nao consegui liberar a VRAM do ComfyUI:", e)
 
 
+
+# ---------------------------------------------------------------- v3: treinar em varias familias
+MODELO_LIVRE_OK = ("name_or_path", "extras_name_or_path", "arch", "is_xl", "is_flux", "is_v2", "is_v_pred",
+                   "quantize", "qtype", "quantize_te", "qtype_te", "low_vram", "model_kwargs", "vae_path")
+
+
+def _acha_modelo(nome, pastas):
+    """Arquivo escolhido pelo app (so o nome) -> caminho na imagem ou no volume."""
+    nome = os.path.basename(str(nome or ""))
+    if not nome:
+        return None
+    for raiz in [r for r in (IMG_ROOT, volume_root()) if r]:
+        for pasta in pastas:
+            p = os.path.join(raiz, pasta, nome)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def modelo_treino(base, spec):
+    """Config do ai-toolkit para cada familia. Modelos de um arquivo (SDXL/SD1.5/Z-Image)
+    vem do volume; os de repositorio (FLUX, Chroma, Qwen-Image) o ai-toolkit baixa do HF."""
+    escolhido = spec.get("modelo")
+    if base == "zimage":
+        if falta("zimage"):
+            r = preparar(["zimage"], spec.get("hf"))
+            if r.get("erros"):
+                return {"error": "faltam arquivos do Z-Image e nao consegui baixar", "detail": r["erros"]}
+        p = _acha_modelo(escolhido, ("diffusion_models", "unet")) if escolhido else None
+        p = p or _tem("diffusion_models", "z_image_bf16.safetensors")
+        return {"model": {"name_or_path": p, "extras_name_or_path": "Tongyi-MAI/Z-Image", "arch": "zimage",
+                          "quantize": True, "qtype": "qfloat8", "quantize_te": True, "qtype_te": "qfloat8", "low_vram": True},
+                "resolucao": [768, 1024], "agendador": "flowmatch", "cache_te": True, "modelo_base": os.path.basename(p or "")}
+    if base in ("sdxl", "sd15"):
+        p = _acha_modelo(escolhido, ("checkpoints",)) if escolhido else None
+        if not p and base == "sdxl":
+            if falta("sdxl"):
+                preparar(["sdxl"], spec.get("hf"))
+            p = _acha_ckpt()
+        if not p:
+            return {"error": "escolha o checkpoint %s (pasta checkpoints do volume) para treinar" % base.upper()}
+        m = {"name_or_path": p, "arch": "sdxl" if base == "sdxl" else "sd1", "quantize": False}
+        if base == "sdxl":
+            m["is_xl"] = True
+        return {"model": m, "resolucao": [1024] if base == "sdxl" else [512, 768],
+                "agendador": "ddpm", "cache_te": False, "train_extra": {"noise_offset": 0.0357},
+                "modelo_base": os.path.basename(p)}
+    if base == "flux":
+        if not spec.get("hf"):
+            return {"error": "o FLUX.1-dev e um repositorio fechado: precisa do token do Hugging Face e da licenca aceita no site"}
+        repo = escolhido or "black-forest-labs/FLUX.1-dev"
+        return {"model": {"name_or_path": repo, "is_flux": True, "arch": "flux", "quantize": True, "low_vram": True},
+                "resolucao": [512, 768, 1024], "agendador": "flowmatch", "cache_te": False, "modelo_base": repo}
+    if base == "chroma":
+        repo = _acha_modelo(escolhido, ("diffusion_models", "unet", "checkpoints")) if escolhido else None
+        repo = repo or escolhido or "lodestones/Chroma"
+        return {"model": {"name_or_path": repo, "arch": "chroma", "quantize": True, "low_vram": True},
+                "resolucao": [512, 768, 1024], "agendador": "flowmatch", "cache_te": False, "modelo_base": repo}
+    if base == "qwen":
+        repo = escolhido or "Qwen/Qwen-Image"
+        return {"model": {"name_or_path": repo, "arch": "qwen_image", "quantize": True,
+                          "qtype": "uint3|ostris/accuracy_recovery_adapters/qwen_image_torchao_uint3.safetensors",
+                          "quantize_te": True, "qtype_te": "qfloat8", "low_vram": True},
+                "resolucao": [768, 1024], "agendador": "flowmatch", "cache_te": True, "modelo_base": repo}
+    if base == "livre":
+        mcfg = {k: v for k, v in (spec.get("modelo_cfg") or {}).items() if k in MODELO_LIVRE_OK}
+        if not mcfg.get("name_or_path") or not mcfg.get("arch"):
+            return {"error": "treino livre: informe pelo menos name_or_path e arch"}
+        p = _acha_modelo(mcfg["name_or_path"], ("checkpoints", "diffusion_models", "unet"))
+        if p:
+            mcfg["name_or_path"] = p
+        res = [int(x) for x in (spec.get("resolucao") or [768, 1024]) if str(x).isdigit()] or [1024]
+        ag = spec.get("agendador") if spec.get("agendador") in ("flowmatch", "ddpm") else "flowmatch"
+        return {"model": mcfg, "resolucao": res, "agendador": ag, "cache_te": bool(spec.get("cache_te", False)),
+                "modelo_base": os.path.basename(str(mcfg["name_or_path"]))}
+    return {"error": "base de treino desconhecida"}
+
+
 def treina_lora(spec, job=None):
     """Roda UM pedaco do treino no ai-toolkit (Z-Image Base). O app chama de novo
     ate chegar no total; o ai-toolkit retoma sozinho do ultimo ponto salvo."""
@@ -830,7 +1069,9 @@ def treina_lora(spec, job=None):
         return {"error": "palavra-chave invalida (use so letras e numeros)"}
     if not os.path.isfile(os.path.join(AITK, "run.py")):
         return {"error": "o treinador (ai-toolkit) nao esta nesta imagem do worker"}
-    base_treino = "zimage"
+    base_treino = (spec.get("base") or "zimage").strip().lower()
+    if base_treino not in SUFIXO:
+        return {"error": "base de treino desconhecida: %s (use %s)" % (base_treino, ", ".join(SUFIXO))}
     pasta = _pasta(spec, base_treino)
     if not pasta:
         return {"error": "pasta de treino invalida"}
@@ -852,12 +1093,9 @@ def treina_lora(spec, job=None):
     # o mesmo worker pode ter gerado fotos antes: o ComfyUI ainda segura ~18 GB
     # de VRAM com o Z-Image carregado, e o treino morre sem memoria. Libera antes.
     _libera_vram_comfy()
-    faltando = falta("zimage")
-    if faltando:
-        r = preparar(["zimage"], spec.get("hf"))
-        if r.get("erros"):
-            return {"error": "faltam arquivos do Z-Image e nao consegui baixar", "detail": r["erros"]}
-    modelo = _tem("diffusion_models", "z_image_bf16.safetensors")
+    mc = modelo_treino(base_treino, spec)
+    if mc.get("error"):
+        return mc
 
     est = estado_treino(pasta)
     feitos = est.get("passos_feitos", 0)
@@ -899,24 +1137,17 @@ def treina_lora(spec, job=None):
                     "folder_path": dados, "caption_ext": "txt",
                     "caption_dropout_rate": 0.05, "shuffle_tokens": False,
                     "cache_latents_to_disk": True,
-                    "resolution": [768, 1024],
+                    "resolution": mc["resolucao"],
                 }],
-                "train": {
+                "train": dict({
                     "batch_size": 1, "steps": alvo, "gradient_accumulation": 1,
                     "train_unet": True, "train_text_encoder": False,
-                    "cache_text_embeddings": True,
-                    "gradient_checkpointing": True, "noise_scheduler": "flowmatch",
+                    "cache_text_embeddings": mc["cache_te"],
+                    "gradient_checkpointing": True, "noise_scheduler": mc["agendador"],
                     "optimizer": "adamw8bit", "lr": float(lr), "dtype": "bf16",
                     "skip_first_sample": True, "disable_sampling": True,
-                },
-                "model": {
-                    "name_or_path": modelo,
-                    "extras_name_or_path": "Tongyi-MAI/Z-Image",
-                    "arch": "zimage",
-                    "quantize": True, "qtype": "qfloat8",
-                    "quantize_te": True, "qtype_te": "qfloat8",
-                    "low_vram": True,
-                },
+                }, **mc.get("train_extra", {})),
+                "model": mc["model"],
                 "sample": {"sampler": "flowmatch", "sample_every": 100000, "width": 1024, "height": 1024, "prompts": []},
             }],
         },
@@ -961,13 +1192,14 @@ def treina_lora(spec, job=None):
         if origem and os.path.isfile(origem):
             destino_dir = os.path.join(models_root() or "", "loras")
             os.makedirs(destino_dir, exist_ok=True)
-            copiado = token + "-zi.safetensors"
+            copiado = token + "-" + SUFIXO[base_treino] + ".safetensors"
             shutil.copyfile(origem, os.path.join(destino_dir, copiado))
     except Exception:
         copiado = None
     return {"ok": True, "pronto": novo.get("passos_feitos", 0) >= total,
             "passos_feitos": novo.get("passos_feitos", 0), "total": total,
             "arquivo": novo.get("ultimo"), "lora": copiado, "base": base_treino,
+            "modelo_base": mc.get("modelo_base"),
             "livre_gb": _livre_gb(),
             "segundos": round(time.time() - t0, 1), "log": cauda[-600:]}
 
@@ -1070,7 +1302,8 @@ def _roda_com_progresso(cmd, env, pasta, feitos, total, job, limite):
 
 def treino_completo(spec, job=None):
     token = (spec.get("token") or "").strip().lower()
-    pasta = _pasta(spec, "zimage")
+    base_tc = (spec.get("base") or "zimage").strip().lower()
+    pasta = _pasta(spec, base_tc)
     if not pasta or not TOKEN_RE.match(token):
         return {"error": "palavra-chave invalida"}
     total = int(spec.get("total") or 2000)
@@ -1088,7 +1321,7 @@ def treino_completo(spec, job=None):
     r["publicado"] = None
     if not r.get("lora"):
         # ja estava treinado (job repetido): publica a copia que ficou em loras/
-        cand = token + "-zi.safetensors"
+        cand = token + "-" + SUFIXO.get(base_tc, "zi") + ".safetensors"
         if os.path.isfile(os.path.join(models_root() or "", "loras", cand)):
             r["lora"] = cand
     hf = (spec.get("hf") or "").strip()
@@ -1200,6 +1433,10 @@ def handler(job):
     if inp.get("ls") is not None:
         return _log(list_models(inp.get("ls")))
 
+    if inp.get("inspeciona") is not None:
+        d = inp["inspeciona"]
+        return _log(inspeciona(d if isinstance(d, dict) else {}))
+
     if inp.get("download"):
         return _log(download_model(inp["download"]))
 
@@ -1254,7 +1491,15 @@ def handler(job):
         txt = json.dumps(wf)
         grupos = [g for g, chave in (("zimage", "z_image_bf16"), ("controlnet", "Z-Image-Fun-Controlnet"),
                                      ("detailer", "yolov8"), ("qwenedit", "Qwen-Image-Edit-2511"),
-                                     ("sdxl", "realvisxl5")) if chave in txt and falta(g)]
+                                     ("sdxl", "realvisxl5"), ("qwen_suporte", "qwen_image_vae")) if chave in txt and falta(g)]
+        # v3: familias abertas — o apoio (codificador de texto/VAE) e reconhecido pelo no que o usa
+        for no in (wf.values() if isinstance(wf, dict) else []):
+            ct = (no or {}).get("class_type"); ins = (no or {}).get("inputs") or {}
+            if ct == "DualCLIPLoader" and ins.get("type") == "flux" and falta("flux_suporte"):
+                grupos.append("flux_suporte")
+            if ct == "CLIPLoader" and ins.get("type") == "chroma" and falta("chroma_suporte"):
+                grupos.append("chroma_suporte")
+        grupos = list(dict.fromkeys(grupos))
         if grupos:
             r = preparar(grupos, inp.get("hf"))
             if r.get("erros"):
