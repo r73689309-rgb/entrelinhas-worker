@@ -1024,7 +1024,8 @@ def modelo_treino(base, spec):
         m = {"name_or_path": p, "arch": "sdxl" if base == "sdxl" else "sd1", "quantize": False}
         if base == "sdxl":
             m["is_xl"] = True
-        return {"model": m, "resolucao": [1024] if base == "sdxl" else [512, 768],
+        # SDXL em 768+1024 (e nao so 1024): cada passo fica bem mais leve e o rosto continua bom
+        return {"model": m, "resolucao": [768, 1024] if base == "sdxl" else [512, 768],
                 "agendador": "ddpm", "cache_te": False, "train_extra": {"noise_offset": 0.0357},
                 "modelo_base": os.path.basename(p)}
     if base == "flux":
